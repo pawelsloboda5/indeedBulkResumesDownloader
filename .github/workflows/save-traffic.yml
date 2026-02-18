@@ -1,0 +1,53 @@
+name: Save Traffic Stats
+
+on:
+  schedule:
+      - cron: '0 0 * * 0'  # Every Sunday at midnight
+        workflow_dispatch:      # Allow manual trigger
+
+        jobs:
+          save-traffic:
+              runs-on: ubuntu-latest
+                  permissions:
+                        contents: write
+
+                            steps:
+                                  - name: Checkout repo
+                                          uses: actions/checkout@v4
+
+                                                - name: Fetch traffic data
+                                                        env:
+                                                                  GH_TOKEN: ${{ secrets.TRAFFIC_TOKEN }}
+                                                                          run: |
+                                                                                    mkdir -p traffic-history
+
+                                                                                              DATE=$(date +%Y-%m-%d)
+
+                                                                                                        # Fetch clones
+                                                                                                                  curl -s -H "Authorization: token $GH_TOKEN" \
+                                                                                                                              "https://api.github.com/repos/YasserLoukniti/indeedBulkResumesDownloader/traffic/clones" \
+                                                                                                                                          > /tmp/clones.json
+                                                                                                                                          
+                                                                                                                                                    # Fetch views
+                                                                                                                                                              curl -s -H "Authorization: token $GH_TOKEN" \
+                                                                                                                                                                          "https://api.github.com/repos/YasserLoukniti/indeedBulkResumesDownloader/traffic/views" \
+                                                                                                                                                                                      > /tmp/views.json
+                                                                                                                                                                                      
+                                                                                                                                                                                                # Fetch referrers
+                                                                                                                                                                                                          curl -s -H "Authorization: token $GH_TOKEN" \
+                                                                                                                                                                                                                      "https://api.github.com/repos/YasserLoukniti/indeedBulkResumesDownloader/traffic/popular/referrers" \
+                                                                                                                                                                                                                                  > /tmp/referrers.json
+                                                                                                                                                                                                                                  
+                                                                                                                                                                                                                                            # Merge into one file
+                                                                                                                                                                                                                                                      echo "{\"date\": \"$DATE\", \"clones\": $(cat /tmp/clones.json), \"views\": $(cat /tmp/views.json), \"referrers\": $(cat /tmp/referrers.json)}" \
+                                                                                                                                                                                                                                                                  > traffic-history/$DATE.json
+                                                                                                                                                                                                                                                                  
+                                                                                                                                                                                                                                                                            echo "Saved traffic data for $DATE"
+                                                                                                                                                                                                                                                                            
+                                                                                                                                                                                                                                                                                  - name: Commit and push
+                                                                                                                                                                                                                                                                                          run: |
+                                                                                                                                                                                                                                                                                                    git config user.name "github-actions[bot]"
+                                                                                                                                                                                                                                                                                                              git config user.email "github-actions[bot]@users.noreply.github.com"
+                                                                                                                                                                                                                                                                                                                        git add traffic-history/
+                                                                                                                                                                                                                                                                                                                                  git diff --cached --quiet || git commit -m "chore: save traffic stats $(date +%Y-%m-%d)"
+                                                                                                                                                                                                                                                                                                                                            git push
