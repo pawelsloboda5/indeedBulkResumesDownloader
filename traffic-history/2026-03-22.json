@@ -1,0 +1,182 @@
+{"date": "2026-03-22", "clones": {
+  "count": 34,
+  "uniques": 25,
+  "clones": [
+    {
+      "timestamp": "2026-03-07T00:00:00Z",
+      "count": 2,
+      "uniques": 2
+    },
+    {
+      "timestamp": "2026-03-08T00:00:00Z",
+      "count": 6,
+      "uniques": 3
+    },
+    {
+      "timestamp": "2026-03-09T00:00:00Z",
+      "count": 2,
+      "uniques": 2
+    },
+    {
+      "timestamp": "2026-03-10T00:00:00Z",
+      "count": 0,
+      "uniques": 0
+    },
+    {
+      "timestamp": "2026-03-11T00:00:00Z",
+      "count": 3,
+      "uniques": 2
+    },
+    {
+      "timestamp": "2026-03-12T00:00:00Z",
+      "count": 1,
+      "uniques": 1
+    },
+    {
+      "timestamp": "2026-03-13T00:00:00Z",
+      "count": 0,
+      "uniques": 0
+    },
+    {
+      "timestamp": "2026-03-14T00:00:00Z",
+      "count": 1,
+      "uniques": 1
+    },
+    {
+      "timestamp": "2026-03-15T00:00:00Z",
+      "count": 11,
+      "uniques": 7
+    },
+    {
+      "timestamp": "2026-03-16T00:00:00Z",
+      "count": 7,
+      "uniques": 7
+    },
+    {
+      "timestamp": "2026-03-17T00:00:00Z",
+      "count": 0,
+      "uniques": 0
+    },
+    {
+      "timestamp": "2026-03-18T00:00:00Z",
+      "count": 0,
+      "uniques": 0
+    },
+    {
+      "timestamp": "2026-03-19T00:00:00Z",
+      "count": 0,
+      "uniques": 0
+    },
+    {
+      "timestamp": "2026-03-20T00:00:00Z",
+      "count": 1,
+      "uniques": 1
+    }
+  ]
+}, "views": {
+  "count": 270,
+  "uniques": 80,
+  "views": [
+    {
+      "timestamp": "2026-03-07T00:00:00Z",
+      "count": 2,
+      "uniques": 1
+    },
+    {
+      "timestamp": "2026-03-08T00:00:00Z",
+      "count": 2,
+      "uniques": 2
+    },
+    {
+      "timestamp": "2026-03-09T00:00:00Z",
+      "count": 24,
+      "uniques": 5
+    },
+    {
+      "timestamp": "2026-03-10T00:00:00Z",
+      "count": 23,
+      "uniques": 12
+    },
+    {
+      "timestamp": "2026-03-11T00:00:00Z",
+      "count": 30,
+      "uniques": 10
+    },
+    {
+      "timestamp": "2026-03-12T00:00:00Z",
+      "count": 35,
+      "uniques": 14
+    },
+    {
+      "timestamp": "2026-03-13T00:00:00Z",
+      "count": 22,
+      "uniques": 7
+    },
+    {
+      "timestamp": "2026-03-14T00:00:00Z",
+      "count": 1,
+      "uniques": 1
+    },
+    {
+      "timestamp": "2026-03-15T00:00:00Z",
+      "count": 19,
+      "uniques": 2
+    },
+    {
+      "timestamp": "2026-03-16T00:00:00Z",
+      "count": 65,
+      "uniques": 12
+    },
+    {
+      "timestamp": "2026-03-17T00:00:00Z",
+      "count": 11,
+      "uniques": 4
+    },
+    {
+      "timestamp": "2026-03-18T00:00:00Z",
+      "count": 10,
+      "uniques": 10
+    },
+    {
+      "timestamp": "2026-03-19T00:00:00Z",
+      "count": 24,
+      "uniques": 6
+    },
+    {
+      "timestamp": "2026-03-20T00:00:00Z",
+      "count": 2,
+      "uniques": 2
+    }
+  ]
+}, "referrers": [
+  {
+    "referrer": "Google",
+    "count": 97,
+    "uniques": 46
+  },
+  {
+    "referrer": "github.com",
+    "count": 24,
+    "uniques": 5
+  },
+  {
+    "referrer": "reddit.com",
+    "count": 20,
+    "uniques": 5
+  },
+  {
+    "referrer": "Bing",
+    "count": 17,
+    "uniques": 7
+  },
+  {
+    "referrer": "statics.teams.cdn.office.net",
+    "count": 7,
+    "uniques": 1
+  },
+  {
+    "referrer": "claude.ai",
+    "count": 1,
+    "uniques": 1
+  }
+]}
