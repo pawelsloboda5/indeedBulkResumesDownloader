@@ -88,56 +88,56 @@ cp .env.example .env.config
 - **Status filter** — Filter jobs by Open, Paused, or Closed
 - **Old job filter** — Jobs older than 2 years are skipped (Indeed archives data)
 - **Multi-pass fetch** — Bypasses Indeed's 3000 candidate limit using multiple sort strategies
-- **Report generation** — Creates `rapport_telechargement.txt` with stats per job
+- **Report generation** — Creates `download_report.txt` with stats per job
 
 ## Menu Walkthrough
 
 ```
 ╔════════════════════════════════════════════════════════════╗
-║         Indeed CV Downloader - Version Unifiee             ║
+║           Indeed CV Downloader - Unified Version           ║
 ╚════════════════════════════════════════════════════════════╝
 
-MODE DE TELECHARGEMENT:
-   1. Backend (API) - Plus rapide, telechargements paralleles
-   2. Frontend (Selenium) - Plus stable, clics simules
+DOWNLOAD MODE:
+   1. Backend (API) - Faster, parallel downloads
+   2. Frontend (Selenium) - More stable, simulated clicks
 
-MODE DE SELECTION DES JOBS:
-   1. Job unique - Vous naviguez vers le job souhaite
-   2. Tous les jobs - Parcourt automatiquement tous les jobs
+JOB SELECTION MODE:
+   1. Single job - You navigate to the desired job
+   2. All jobs - Automatically processes every job
 
-STATUT DES ANNONCES A TRAITER:
-   1. Ouvertes uniquement
-   2. Suspendues uniquement
-   3. Fermees uniquement
-   4. Ouvertes + Suspendues
-   5. Toutes
+JOB STATUS FILTER:
+   1. Open only
+   2. Paused only
+   3. Closed only
+   4. Open + Paused
+   5. All
 ```
 
 ### Example: All Jobs Mode
 
 ```
-145 jobs recuperes
+145 jobs fetched
 
-Liste des jobs:
+Job list:
 ------------------------------------------------------------
      1. [O] Business Developer
-        Date: 22-09-2025 | Candidats: 237
+        Date: 22-09-2025 | Candidates: 237
      2. [P] Data Scientist
-        Date: 01-07-2025 | Candidats: 550
+        Date: 01-07-2025 | Candidates: 550
      3. [F] Marketing Manager
-        Date: 15-06-2025 | Candidats: 120
+        Date: 15-06-2025 | Candidates: 120
 ------------------------------------------------------------
 
-JOBS DEJA PRESENTS DANS LE DOSSIER DOWNLOADS:
+JOBS ALREADY PRESENT IN THE DOWNLOADS FOLDER:
 ============================================================
    [NEW] Data Scientist
-         450 traites / 550 recuperes (+100 restants)
+         450 processed / 550 fetched (+100 remaining)
    [OK]  Marketing Manager (120/120)
 
 Options:
-   [S] SkipAll - Ignorer TOUS les jobs existants
-   [N] NewOnly - Telecharger seulement les jobs avec nouveaux candidats
-   [K] KeepAll - Telecharger quand meme tous les jobs
+   [S] SkipAll - Skip ALL existing jobs
+   [N] NewOnly - Only download jobs with new candidates
+   [K] KeepAll - Download every job anyway
 ```
 
 ## Configuration
@@ -174,7 +174,7 @@ indeed-cv-downloader/
 │   │   ├── no_cv.txt           # Candidates without CV
 │   │   ├── stats.json          # Job download statistics
 │   │   └── checkpoint.json     # Resume state for this job
-│   └── rapport_telechargement.txt  # Global download report
+│   └── download_report.txt     # Global download report
 └── logs/
     ├── indeed_cookies.json     # Auto-saved session cookies
     └── checkpoint_unified.json # Global resume state
@@ -229,7 +229,7 @@ Pull requests welcome. For major changes, open an issue first.
 
 ### v2.5.0 (2025-11-27)
 
-- Download report generation (`rapport_telechargement.txt`)
+- Download report generation (`download_report.txt`)
 - Job completion tracking with `stats.json`
 - Archived candidates handling
 

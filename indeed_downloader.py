@@ -104,57 +104,57 @@ class IndeedDownloader:
         """Display main menu and get user choices"""
         print("""
 ╔════════════════════════════════════════════════════════════╗
-║         Indeed CV Downloader - Version Unifiée             ║
+║           Indeed CV Downloader - Unified Version           ║
 ╚════════════════════════════════════════════════════════════╝
 """)
 
         # Mode selection
-        print("📥 MODE DE TÉLÉCHARGEMENT:")
-        print("   1. Backend (API) - Plus rapide, téléchargements parallèles")
-        print("   2. Frontend (Selenium) - Plus stable, clics simulés")
+        print("📥 DOWNLOAD MODE:")
+        print("   1. Backend (API) - Faster, parallel downloads")
+        print("   2. Frontend (Selenium) - More stable, simulated clicks")
         print()
 
         while True:
-            choice = input("Choix (1/2): ").strip()
+            choice = input("Choice (1/2): ").strip()
             if choice == '1':
                 self.mode = 'backend'
                 break
             elif choice == '2':
                 self.mode = 'frontend'
                 break
-            print("❌ Choix invalide")
+            print("❌ Invalid choice")
 
         print()
 
         # Job mode selection
-        print("📋 MODE DE SÉLECTION DES JOBS:")
-        print("   1. Job unique - Vous naviguez vers le job souhaité")
-        print("   2. Tous les jobs - Parcourt automatiquement tous les jobs")
+        print("📋 JOB SELECTION MODE:")
+        print("   1. Single job - You navigate to the desired job")
+        print("   2. All jobs - Automatically processes every job")
         print()
 
         while True:
-            choice = input("Choix (1/2): ").strip()
+            choice = input("Choice (1/2): ").strip()
             if choice == '1':
                 self.job_mode = 'single'
                 break
             elif choice == '2':
                 self.job_mode = 'all'
                 break
-            print("❌ Choix invalide")
+            print("❌ Invalid choice")
 
         # Status filter (only for 'all' mode)
         if self.job_mode == 'all':
             print()
-            print("📊 STATUT DES ANNONCES À TRAITER:")
-            print("   1. Ouvertes uniquement (ACTIVE)")
-            print("   2. Suspendues uniquement (PAUSED)")
-            print("   3. Fermées uniquement (CLOSED)")
-            print("   4. Ouvertes + Suspendues")
-            print("   5. Toutes (Ouvertes + Suspendues + Fermées)")
+            print("📊 JOB STATUS FILTER:")
+            print("   1. Open only (ACTIVE)")
+            print("   2. Paused only (PAUSED)")
+            print("   3. Closed only (CLOSED)")
+            print("   4. Open + Paused")
+            print("   5. All (Open + Paused + Closed)")
             print()
 
             while True:
-                choice = input("Choix (1-5): ").strip()
+                choice = input("Choice (1-5): ").strip()
                 if choice == '1':
                     self.job_statuses = ['ACTIVE']
                     break
@@ -170,20 +170,20 @@ class IndeedDownloader:
                 elif choice == '5':
                     self.job_statuses = ['ACTIVE', 'PAUSED', 'CLOSED']
                     break
-                print("❌ Choix invalide")
+                print("❌ Invalid choice")
 
         print()
         print("=" * 60)
         print(f"✅ Mode: {self.mode.upper()}")
-        print(f"✅ Jobs: {'Unique' if self.job_mode == 'single' else 'Tous'}")
+        print(f"✅ Jobs: {'Single' if self.job_mode == 'single' else 'All'}")
         if self.job_mode == 'all':
-            print(f"✅ Statuts: {', '.join(self.job_statuses)}")
+            print(f"✅ Statuses: {', '.join(self.job_statuses)}")
         print("=" * 60)
         print()
 
     def _init_chrome(self):
         """Initialize Chrome browser with options"""
-        print("🌐 Ouverture de Chrome...")
+        print("🌐 Opening Chrome...")
 
         chromedriver_autoinstaller.install()
 
@@ -296,19 +296,19 @@ class IndeedDownloader:
         cookies_file = Path(self.log_folder) / 'indeed_cookies.json'
         with open(cookies_file, 'w', encoding='utf-8') as f:
             json.dump(cookies, f, indent=2, ensure_ascii=False)
-        print(f"   ✅ {len(cookies)} cookies sauvegardés pour les prochaines sessions")
+        print(f"   ✅ {len(cookies)} cookies saved for future sessions")
 
     def _wait_for_login(self):
         """Wait for user to manually log in to Indeed Employer"""
         print()
         print("=" * 60)
-        print("🔐 CONNEXION REQUISE")
+        print("🔐 LOGIN REQUIRED")
         print("=" * 60)
         print()
-        print("   Connectez-vous à votre compte Indeed Employer")
-        print("   dans la fenêtre Chrome qui vient de s'ouvrir.")
+        print("   Please log in to your Indeed Employer account")
+        print("   in the Chrome window that just opened.")
         print()
-        print("   En attente de connexion...")
+        print("   Waiting for login...")
         print()
 
         # Navigate to the login page
@@ -327,16 +327,16 @@ class IndeedDownloader:
                 # Check if we've been redirected to the employer dashboard
                 if 'employers.indeed.com' in current_url and '/auth' not in current_url:
                     if self._is_logged_in():
-                        print("   ✅ Connexion détectée!")
+                        print("   ✅ Login detected!")
                         return True
             except Exception:
                 continue
 
             # Show progress every 30 seconds
             if elapsed % 30 == 0:
-                print(f"   ⏳ En attente... ({elapsed}s)")
+                print(f"   ⏳ Waiting... ({elapsed}s)")
 
-        print("   ❌ Délai d'attente dépassé (5 minutes)")
+        print("   ❌ Login timeout exceeded (5 minutes)")
         return False
 
     def setup_chrome(self) -> bool:
@@ -347,7 +347,7 @@ class IndeedDownloader:
         saved_cookies = self._load_saved_cookies()
 
         if saved_cookies:
-            print("🔑 Cookies sauvegardés trouvés, tentative de connexion...")
+            print("🔑 Saved cookies found, attempting to log in...")
             self._inject_cookies(saved_cookies)
 
             # Navigate to employer dashboard to check if session is valid
@@ -355,11 +355,11 @@ class IndeedDownloader:
             time.sleep(4)
 
             if self._is_logged_in():
-                print("✅ Connecté avec les cookies sauvegardés")
+                print("✅ Logged in with saved cookies")
                 self._capture_api_key()
                 return True
             else:
-                print("⚠️  Cookies expirés ou invalides")
+                print("⚠️  Cookies expired or invalid")
 
         # No valid cookies - ask user to log in manually
         if not self._wait_for_login():
@@ -373,12 +373,12 @@ class IndeedDownloader:
         if cookies:
             self._save_cookies(cookies)
         else:
-            print("   ⚠️  Aucun cookie Indeed capturé")
+            print("   ⚠️  No Indeed cookies captured")
 
         # Navigate to candidates page and capture API key
         self._capture_api_key()
 
-        print("✅ Authentification réussie!")
+        print("✅ Authentication successful!")
         return True
 
     def _capture_api_key(self):
@@ -404,19 +404,19 @@ class IndeedDownloader:
                     continue
 
             if self.api_key:
-                print(f"   ✅ API Key capturée")
+                print(f"   ✅ API Key captured")
         except Exception:
             pass
 
     def _clean_job_title(self, title: str) -> str:
-        """Nettoie le titre du job pour créer un nom de dossier valide"""
-        # Enlever (H/F), H/F, (F/H), F/H et variantes
+        """Clean the job title to produce a valid folder name"""
+        # Remove (H/F), H/F, (F/H), F/H and variants (French gender markers)
         title = re.sub(r'\s*\(?\s*[HF]\s*/\s*[HF]\s*\)?\s*', '', title, flags=re.IGNORECASE)
-        # Remplacer / par -
+        # Replace / with -
         title = title.replace('/', '-')
-        # Enlever les caractères invalides pour un nom de dossier Windows
+        # Remove invalid characters for a Windows folder name
         title = re.sub(r'[<>:"|?*]', '', title)
-        # Enlever les espaces multiples
+        # Collapse multiple spaces
         title = re.sub(r'\s+', ' ', title)
         # Trim
         title = title.strip()
@@ -579,7 +579,7 @@ class IndeedDownloader:
         payload = {"operationName": "FindRCPMatches", "variables": variables, "query": query}
 
         js_code = f"""
-        return await fetch("https://apis.indeed.com/graphql?co=FR&locale=fr-FR", {{
+        return await fetch("https://apis.indeed.com/graphql?co=US&locale=en-US", {{
             method: "POST",
             headers: {{
                 "accept": "*/*",
@@ -603,7 +603,7 @@ class IndeedDownloader:
             total = result.get('data', {}).get('findRCPMatches', {}).get('overallMatchCount', 0)
             return matches, total
         except Exception as e:
-            print(f"❌ Erreur API: {e}")
+            print(f"❌ API error: {e}")
             return [], 0
 
     def download_cv_api(self, candidate: dict) -> bool:
@@ -670,8 +670,8 @@ class IndeedDownloader:
     def run_backend_single_job(self):
         """Run backend mode for single job"""
         print("\n" + "=" * 60)
-        print("👆 Naviguez vers le job souhaité dans Chrome")
-        print("   puis appuyez sur Entrée")
+        print("👆 Navigate to the desired job in Chrome")
+        print("   then press Enter")
         print("=" * 60)
         input()
 
@@ -687,7 +687,7 @@ class IndeedDownloader:
                 return el ? el.textContent.trim() : 'Job';
             """)
             self._create_job_folder(job_name)
-            print(f"📁 Dossier: {self.current_job_folder}")
+            print(f"📁 Folder: {self.current_job_folder}")
         except Exception:
             pass
 
@@ -718,13 +718,13 @@ class IndeedDownloader:
 
         # Scan existing PDF files to get names (only for existing jobs with new candidates)
         if scan_pdfs:
-            print("   Scan des CVs existants...")
+            print("   Scanning existing CVs...")
             for pdf_file in self.current_job_folder.glob('*.pdf'):
                 # Format: "Jean Dupont_20251126_154317.pdf"
                 name_part = pdf_file.stem.rsplit('_', 2)[0]  # Get "Jean Dupont"
                 if name_part:
                     downloaded_names.add(name_part.lower())
-            print(f"   {len(downloaded_names)} noms trouves dans les fichiers existants")
+            print(f"   {len(downloaded_names)} names found in existing files")
 
         return downloaded_ids, downloaded_names
 
@@ -812,65 +812,65 @@ class IndeedDownloader:
         Args:
             job_total_candidates: Total candidates from job listing (used to decide if we need multi-pass)
         """
-        print("\nRecuperation des candidats via API...")
+        print("\nFetching candidates via API...")
 
         # All disposition types
         all_dispositions = ["NEW", "PENDING", "PHONE_SCREENED", "INTERVIEWED", "OFFER_MADE", "REVIEWED"]
         all_candidates = {}  # key: legacy_id, value: candidate dict
 
-        # Passe 1: Tri par date DESC (défaut)
-        print("   Recuperation des candidats...")
+        # Pass 1: Sort by date DESC (default)
+        print("   Fetching candidates...")
         candidates, api_total = self._fetch_candidates_batch(all_dispositions, "APPLY_DATE", "DESCENDING")
         for c in candidates:
             if c['legacy_id'] not in all_candidates:
                 all_candidates[c['legacy_id']] = c
-        print(f"      {len(all_candidates)} recuperes")
+        print(f"      {len(all_candidates)} fetched")
 
         # Use job_total_candidates if available (more accurate), otherwise use API total
         total_expected = job_total_candidates if job_total_candidates > 0 else api_total
 
-        # Si on a tout récupéré ou si <= 3000 attendus, pas besoin de passes supplémentaires
+        # If we got everything or expected <= 3000, no extra passes needed
         if len(all_candidates) >= total_expected or total_expected <= 3000:
-            pass  # On a tout, pas besoin de passes supplémentaires
+            pass  # Got everything, no additional passes needed
         else:
-            # Passes supplémentaires pour dépasser la limite de 3000
-            print(f"   Limite API atteinte ({len(all_candidates)}/{total_expected}), passes supplementaires...")
+            # Additional passes to get past the 3000 limit
+            print(f"   API limit reached ({len(all_candidates)}/{total_expected}), running additional passes...")
 
-            # Passe 2: Tri par date ASC
-            print("   Passe 2: Par date (ancien -> recent)...")
+            # Pass 2: Sort by date ASC
+            print("   Pass 2: By date (oldest -> newest)...")
             candidates, _ = self._fetch_candidates_batch(all_dispositions, "APPLY_DATE", "ASCENDING")
             new_count = 0
             for c in candidates:
                 if c['legacy_id'] not in all_candidates:
                     all_candidates[c['legacy_id']] = c
                     new_count += 1
-            print(f"      +{new_count} nouveaux, total: {len(all_candidates)}")
+            print(f"      +{new_count} new, total: {len(all_candidates)}")
 
-            # Passe 3: Tri par nom ASC (si encore manquant)
+            # Pass 3: Sort by name ASC (if still missing)
             if len(all_candidates) < total_expected:
-                print("   Passe 3: Par nom (A -> Z)...")
+                print("   Pass 3: By name (A -> Z)...")
                 candidates, _ = self._fetch_candidates_batch(all_dispositions, "NAME", "ASCENDING")
                 new_count = 0
                 for c in candidates:
                     if c['legacy_id'] not in all_candidates:
                         all_candidates[c['legacy_id']] = c
                         new_count += 1
-                print(f"      +{new_count} nouveaux, total: {len(all_candidates)}")
+                print(f"      +{new_count} new, total: {len(all_candidates)}")
 
-            # Passe 4: Tri par nom DESC (si encore manquant)
+            # Pass 4: Sort by name DESC (if still missing)
             if len(all_candidates) < total_expected:
-                print("   Passe 4: Par nom (Z -> A)...")
+                print("   Pass 4: By name (Z -> A)...")
                 candidates, _ = self._fetch_candidates_batch(all_dispositions, "NAME", "DESCENDING")
                 new_count = 0
                 for c in candidates:
                     if c['legacy_id'] not in all_candidates:
                         all_candidates[c['legacy_id']] = c
                         new_count += 1
-                print(f"      +{new_count} nouveaux, total: {len(all_candidates)}")
+                print(f"      +{new_count} new, total: {len(all_candidates)}")
 
-            # Passe 5: Par statut individuel (si >1000 manquants)
+            # Pass 5: By individual status (if >1000 missing)
             if len(all_candidates) < total_expected and (total_expected - len(all_candidates)) > 1000:
-                print("   Passe 5: Par statut individuel...")
+                print("   Pass 5: By individual status...")
                 for disp in all_dispositions:
                     for sort_by in ["APPLY_DATE", "NAME"]:
                         for sort_order in ["ASCENDING", "DESCENDING"]:
@@ -886,17 +886,17 @@ class IndeedDownloader:
 
         all_candidates_list = list(all_candidates.values())
 
-        print(f"\n   Total attendu: {total_expected} | Recuperes: {len(all_candidates_list)}")
+        print(f"\n   Total expected: {total_expected} | Fetched: {len(all_candidates_list)}")
 
         if len(all_candidates_list) == 0 and total_expected > 0:
-            print(f"   Aucun candidat recupere - job trop ancien ou donnees archivees")
+            print(f"   No candidates fetched - job too old or data archived")
             self.stats['archived'] += 1
             return
 
         if len(all_candidates_list) < total_expected:
             missing = total_expected - len(all_candidates_list)
             pct = (len(all_candidates_list) / total_expected) * 100
-            print(f"   Note: {missing} candidats non recuperes ({pct:.1f}% recuperes)")
+            print(f"   Note: {missing} candidates not fetched ({pct:.1f}% fetched)")
 
         # Load already processed names (PDFs + no_cv.txt)
         processed_names = set()
@@ -939,15 +939,15 @@ class IndeedDownloader:
             with open(no_cv_file, 'a', encoding='utf-8') as f:
                 for c in candidates_no_cv:
                     f.write(c['name'] + '\n')
-            print(f"   {len(candidates_no_cv)} candidats sans CV (sauvegardes dans no_cv.txt)")
+            print(f"   {len(candidates_no_cv)} candidates without CV (saved to no_cv.txt)")
 
-        print(f"\n   A telecharger: {len(candidates_with_cv)} | Deja fait: {already_processed} | Sans CV: {len(candidates_no_cv)}")
+        print(f"\n   To download: {len(candidates_with_cv)} | Already done: {already_processed} | Without CV: {len(candidates_no_cv)}")
 
         # Use recovered count (not announced) - some candidates may be archived by Indeed
         total_recovered = len(all_candidates_list)
 
         if not candidates_with_cv:
-            print("   Tous les CVs sont deja telecharges!")
+            print("   All CVs are already downloaded!")
             # Save stats: announced, recovered, processed
             self._save_job_stats(total_expected, total_recovered, already_processed + len(candidates_no_cv))
             # Track job stats for report
@@ -961,7 +961,7 @@ class IndeedDownloader:
             })
             return
 
-        print(f"\n   Telechargement...\n")
+        print(f"\n   Downloading...\n")
 
         downloaded_count = 0
         with tqdm(total=len(candidates_with_cv), desc="   CVs") as pbar:
@@ -989,8 +989,8 @@ class IndeedDownloader:
     def run_frontend_single_job(self):
         """Run frontend mode for single job"""
         print("\n" + "=" * 60)
-        print("👆 Naviguez vers le job et cliquez sur le premier candidat")
-        print("   puis appuyez sur Entrée")
+        print("👆 Navigate to the job and click on the first candidate")
+        print("   then press Enter")
         print("=" * 60)
         input()
 
@@ -1002,7 +1002,7 @@ class IndeedDownloader:
                 return el ? el.textContent.trim() : 'Job';
             """)
             self._create_job_folder(job_name)
-            print(f"📁 Dossier: {self.current_job_folder}")
+            print(f"📁 Folder: {self.current_job_folder}")
         except Exception:
             pass
 
@@ -1010,7 +1010,7 @@ class IndeedDownloader:
 
     def _download_all_candidates_frontend(self):
         """Download candidates using Selenium clicks"""
-        print("\n🚀 Téléchargement via Selenium...\n")
+        print("\n🚀 Downloading via Selenium...\n")
 
         pbar = tqdm(desc="CVs")
         count = 0
@@ -1153,17 +1153,28 @@ class IndeedDownloader:
 
     # ==================== ALL JOBS MODE ====================
 
-    def _format_date_fr(self, date_str: str) -> str:
-        """Convertit 'septembre 22, 2025' en '22-09-2025'"""
+    def _format_date(self, date_str: str) -> str:
+        """Convert 'septembre 22, 2025' (or 'september 22, 2025') into '22-09-2025'
+
+        Parses month names from Indeed's dashboard output, which may be in French
+        or English depending on the account locale.
+        """
+        # French month names - required because Indeed's French dashboard emits these.
         months_fr = {
             'janvier': '01', 'février': '02', 'mars': '03', 'avril': '04',
             'mai': '05', 'juin': '06', 'juillet': '07', 'août': '08',
             'septembre': '09', 'octobre': '10', 'novembre': '11', 'décembre': '12'
         }
+        # English month names - used when Indeed's dashboard is in English.
+        months_en = {
+            'january': '01', 'february': '02', 'march': '03', 'april': '04',
+            'may': '05', 'june': '06', 'july': '07', 'august': '08',
+            'september': '09', 'october': '10', 'november': '11', 'december': '12'
+        }
         try:
             parts = date_str.lower().split()
             if len(parts) >= 3:
-                month = months_fr.get(parts[0], '00')
+                month = months_fr.get(parts[0]) or months_en.get(parts[0], '00')
                 day = parts[1].replace(',', '').zfill(2)
                 year = parts[2]
                 return f"{day}-{month}-{year}"
@@ -1172,14 +1183,14 @@ class IndeedDownloader:
         return date_str
 
     def _extract_jobs_from_page(self) -> list:
-        """Extrait les jobs de la page actuelle du tableau HTML"""
+        """Extract jobs from the current HTML table page"""
         jobs = []
         try:
             rows = self.driver.find_elements(By.CSS_SELECTOR, "tr[data-testid='job-row']")
 
             for row in rows:
                 try:
-                    # Titre du job - essayer plusieurs sélecteurs
+                    # Job title - try multiple selectors
                     title_elem = None
                     job_link = None
 
@@ -1203,10 +1214,10 @@ class IndeedDownloader:
                     if not title:
                         continue
 
-                    # Nettoyer le titre
+                    # Clean the title
                     clean_title = self._clean_job_title(title)
 
-                    # Date de publication
+                    # Posting date
                     date_str = ""
                     date_formatted = ""
                     try:
@@ -1214,11 +1225,11 @@ class IndeedDownloader:
                         date_title = date_elem.get_attribute('title')
                         date_match = re.search(r'(\w+ \d+, \d+)', date_title)
                         date_str = date_match.group(1) if date_match else ""
-                        date_formatted = self._format_date_fr(date_str)
+                        date_formatted = self._format_date(date_str)
                     except (NoSuchElementException, AttributeError):
                         pass
 
-                    # Nombre de candidats
+                    # Candidate count
                     total_candidates = 0
                     try:
                         candidates_elem = row.find_element(By.CSS_SELECTOR, "span[data-testid='candidates-pipeline-hosted-all-count']")
@@ -1226,10 +1237,13 @@ class IndeedDownloader:
                     except (NoSuchElementException, ValueError):
                         pass
 
-                    # Statut - essayer plusieurs sélecteurs
-                    status = "ACTIVE"  # Par défaut si on ne trouve pas
+                    # Status - try multiple selectors. The status text matchers include
+                    # French substrings ('ouvert', 'suspendu', 'fermé', 'clos') because
+                    # Indeed's French dashboard returns those — keep them alongside the
+                    # English alternates so the tool works for both locales.
+                    status = "ACTIVE"  # Default if nothing matches
                     try:
-                        # Essayer le sélecteur principal
+                        # Try the primary selector
                         status_elem = row.find_element(By.CSS_SELECTOR, "div[data-testid='top-level-job-status']")
                         status_text = status_elem.text.strip().lower()
 
@@ -1242,7 +1256,7 @@ class IndeedDownloader:
                     except NoSuchElementException:
                         pass
 
-                    # Extraire l'employerJobId du lien
+                    # Extract the employerJobId from the link
                     employer_job_id = None
                     if job_link:
                         # Try employerJobId first
@@ -1274,12 +1288,12 @@ class IndeedDownloader:
                     continue
 
         except Exception as e:
-            print(f"❌ Erreur extraction jobs: {e}")
+            print(f"❌ Job extraction error: {e}")
 
         return jobs
 
     def _has_next_page(self) -> bool:
-        """Vérifie si le bouton Suivant est actif"""
+        """Check whether the Next button is active"""
         try:
             next_btn = self.driver.find_element(By.ID, "ejsJobListPaginationNextBtn")
             return not next_btn.get_attribute('disabled')
@@ -1287,32 +1301,32 @@ class IndeedDownloader:
             return False
 
     def _click_next_page(self) -> bool:
-        """Clique sur le bouton Suivant"""
+        """Click the Next button"""
         try:
             next_btn = self.driver.find_element(By.ID, "ejsJobListPaginationNextBtn")
             if next_btn.get_attribute('disabled'):
                 return False
 
-            # Scroll vers le bouton et cliquer
+            # Scroll to the button and click
             self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", next_btn)
             time.sleep(0.5)
             next_btn.click()
             time.sleep(3)
 
-            # Attendre que le tableau soit rechargé
+            # Wait for the table to reload
             WebDriverWait(self.driver, 15).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, "tr[data-testid='job-row']"))
             )
             return True
         except Exception as e:
-            print(f"      Erreur pagination: {e}")
+            print(f"      Pagination error: {e}")
         return False
 
     def fetch_all_jobs(self) -> list:
         """Fetch all jobs from HTML table with pagination"""
-        print("\nRecuperation de la liste des jobs...")
+        print("\nFetching job list...")
 
-        # Construire l'URL avec les filtres de statut
+        # Build the URL with status filters
         status_params = []
         if 'ACTIVE' in self.job_statuses:
             status_params.append('open')
@@ -1333,16 +1347,16 @@ class IndeedDownloader:
                 EC.presence_of_element_located((By.CSS_SELECTOR, "tr[data-testid='job-row']"))
             )
         except TimeoutException:
-            print("Tableau des jobs non trouve")
+            print("Job table not found")
             return []
 
         # Close any modals that might appear
         self._close_modals()
 
-        # Récupérer le nombre total affiché
+        # Read the total count shown on the page
         try:
             total_text = self.driver.find_element(By.CSS_SELECTOR, "span[data-testid='job-count'], .css-1f9ew9y").text
-            print(f"   Total affiche sur la page: {total_text}")
+            print(f"   Total shown on page: {total_text}")
         except NoSuchElementException:
             pass
 
@@ -1352,34 +1366,34 @@ class IndeedDownloader:
         while True:
             print(f"   Page {page}...")
 
-            # Attendre que les lignes soient chargées
+            # Wait for rows to load
             time.sleep(1)
 
             jobs = self._extract_jobs_from_page()
 
-            # Ne pas filtrer par statut ici car l'URL filtre déjà
+            # No need to filter by status here - the URL already filters
             all_jobs.extend(jobs)
 
-            print(f"      {len(jobs)} jobs sur cette page (total: {len(all_jobs)})")
+            print(f"      {len(jobs)} jobs on this page (total: {len(all_jobs)})")
 
             if self._has_next_page():
                 if not self._click_next_page():
                     break
                 page += 1
-                time.sleep(1)  # Attendre le chargement
+                time.sleep(1)  # Wait for loading
             else:
                 break
 
-        print(f"\n{len(all_jobs)} jobs recuperes")
+        print(f"\n{len(all_jobs)} jobs fetched")
 
-        # Afficher la liste des jobs trouvés
-        print("\nListe des jobs:")
+        # Display the list of jobs found
+        print("\nJob list:")
         print("-" * 60)
         for i, job in enumerate(all_jobs, 1):
             status_icon = "[O]" if job['status'] == 'ACTIVE' else "[P]" if job['status'] == 'PAUSED' else "[F]"
             print(f"   {i:3}. {status_icon} {job['title_clean']}")
             if job['date']:
-                print(f"        Date: {job['date']} | Candidats: {job['total_candidates']}")
+                print(f"        Date: {job['date']} | Candidates: {job['total_candidates']}")
         print("-" * 60)
 
         return all_jobs
@@ -1469,7 +1483,7 @@ class IndeedDownloader:
                         'matched_job_id': None
                     }
 
-        print(f"\n   {len(folder_info)} dossiers trouves dans '{self.download_folder}/'")
+        print(f"\n   {len(folder_info)} folders found in '{self.download_folder}/'")
 
         # Match jobs with folders - each folder can only match ONE job
         # First pass: match jobs that have exact name + date match (highest priority)
@@ -1506,7 +1520,7 @@ class IndeedDownloader:
                     matched_count += 1
                     break
 
-        print(f"   {matched_count} dossiers correspondent a des jobs")
+        print(f"   {matched_count} folders match jobs")
 
         # Second pass: for jobs without date match, try name-only match (only for folders without date)
         for job in jobs:
@@ -1582,7 +1596,7 @@ class IndeedDownloader:
             return jobs
 
         print("\n" + "=" * 60)
-        print("JOBS DEJA PRESENTS DANS LE DOSSIER DOWNLOADS:")
+        print("JOBS ALREADY PRESENT IN THE DOWNLOADS FOLDER:")
         print("=" * 60)
 
         jobs_with_new = []
@@ -1604,50 +1618,50 @@ class IndeedDownloader:
             if cv_count < total_recovered:
                 jobs_with_new.append((job_id, info))
                 print(f"   [NEW] {title_with_date}")
-                print(f"         Dossier: {folder}")
-                print(f"         {cv_count} traites / {total_recovered} recuperes (+{total_recovered - cv_count} restants)")
+                print(f"         Folder: {folder}")
+                print(f"         {cv_count} processed / {total_recovered} fetched (+{total_recovered - cv_count} remaining)")
             else:
                 jobs_complete.append((job_id, info))
                 # Show both recovered and announced if different
                 if total_recovered < total_announced:
-                    print(f"   [OK]  {title_with_date} ({cv_count}/{total_recovered} recuperes, {total_announced} annonces)")
+                    print(f"   [OK]  {title_with_date} ({cv_count}/{total_recovered} fetched, {total_announced} posted)")
                 else:
                     print(f"   [OK]  {title_with_date} ({cv_count}/{total_announced})")
 
         print()
         if jobs_with_new:
-            print(f"   {len(jobs_with_new)} jobs avec nouveaux candidats")
-        print(f"   {len(jobs_complete)} jobs complets")
+            print(f"   {len(jobs_with_new)} jobs with new candidates")
+        print(f"   {len(jobs_complete)} complete jobs")
         print()
         print("Options:")
-        print("   [S] SkipAll - Ignorer TOUS les jobs existants")
-        print("   [N] NewOnly - Telecharger seulement les jobs avec nouveaux candidats")
-        print("   [K] KeepAll - Telecharger quand meme tous les jobs")
+        print("   [S] SkipAll - Skip ALL existing jobs")
+        print("   [N] NewOnly - Only download jobs with new candidates")
+        print("   [K] KeepAll - Download every job anyway")
         print()
 
         while True:
-            choice = input("Votre choix (S/N/K): ").strip().upper()
+            choice = input("Your choice (S/N/K): ").strip().upper()
 
             if choice == 'S':
                 # Skip all existing
                 jobs_to_skip = set(existing_jobs.keys())
                 filtered_jobs = [j for j in jobs if j['id'] not in jobs_to_skip]
-                print(f"\n{len(jobs_to_skip)} jobs ignores")
+                print(f"\n{len(jobs_to_skip)} jobs skipped")
                 return filtered_jobs
 
             elif choice == 'N':
                 # Only jobs with new candidates
                 jobs_with_new_ids = set(job_id for job_id, _ in jobs_with_new)
                 filtered_jobs = [j for j in jobs if j['id'] in jobs_with_new_ids]
-                print(f"\n{len(jobs_complete)} jobs complets ignores, {len(filtered_jobs)} a traiter")
+                print(f"\n{len(jobs_complete)} complete jobs skipped, {len(filtered_jobs)} to process")
                 return filtered_jobs
 
             elif choice == 'K':
                 # Keep all
-                print("\nTous les jobs seront traites")
+                print("\nAll jobs will be processed")
                 return jobs
 
-            print("Choix invalide, tapez S, N ou K")
+            print("Invalid choice, type S, N or K")
 
     def _filter_old_jobs(self, jobs: list) -> list:
         """Filter out jobs older than 2 years (Indeed archives candidate data after ~2 years)"""
@@ -1671,7 +1685,7 @@ class IndeedDownloader:
             filtered_jobs.append(job)
 
         if old_jobs_count > 0:
-            print(f"\n   {old_jobs_count} jobs de plus de 2 ans ignores (donnees archivees par Indeed)")
+            print(f"\n   {old_jobs_count} jobs older than 2 years skipped (data archived by Indeed)")
 
         return filtered_jobs
 
@@ -1680,14 +1694,14 @@ class IndeedDownloader:
         jobs = self.fetch_all_jobs()
 
         if not jobs:
-            print("Aucun job trouve")
+            print("No jobs found")
             return
 
         # Filter out jobs older than 2 years (Indeed archives data)
         jobs = self._filter_old_jobs(jobs)
 
         if not jobs:
-            print("Aucun job recent a traiter (tous > 2 ans)")
+            print("No recent jobs to process (all > 2 years)")
             return
 
         # Check for existing folders (compare by name, not checkpoint)
@@ -1697,16 +1711,16 @@ class IndeedDownloader:
             jobs = self._ask_skip_existing_jobs(jobs, existing_jobs)
 
         if not jobs:
-            print("Aucun job a traiter!")
+            print("No jobs to process!")
             return
 
-        print(f"\n{len(jobs)} jobs a traiter")
+        print(f"\n{len(jobs)} jobs to process")
         print("=" * 60)
 
         for i, job in enumerate(jobs):
             title_display = job.get('title_clean', job['title'])
             print(f"\n[{i+1}/{len(jobs)}] {title_display}")
-            print(f"         Status: {job['status']}, Date: {job['date'] or 'N/A'}, Candidats: {job.get('total_candidates', '?')}")
+            print(f"         Status: {job['status']}, Date: {job['date'] or 'N/A'}, Candidates: {job.get('total_candidates', '?')}")
 
             self.current_job_id = job['id']
             self.current_job_name = job['title']
@@ -1725,32 +1739,32 @@ class IndeedDownloader:
                 self._download_all_candidates_frontend()
 
             self._save_checkpoint(job_id=job['id'])
-            print(f"   Job termine: {title_display}")
+            print(f"   Job finished: {title_display}")
 
     # ==================== MAIN ====================
 
     def print_statistics(self):
         """Print final statistics"""
         print("\n" + "=" * 60)
-        print("STATISTIQUES")
+        print("STATISTICS")
         print("=" * 60)
-        print(f"Total traites:  {self.stats['total_processed']}")
-        print(f"Telecharges:    {self.stats['downloaded']}")
-        print(f"Ignores:        {self.stats['skipped']}")
-        print(f"Echecs:         {self.stats['failed']}")
+        print(f"Total processed:  {self.stats['total_processed']}")
+        print(f"Downloaded:       {self.stats['downloaded']}")
+        print(f"Skipped:          {self.stats['skipped']}")
+        print(f"Failed:           {self.stats['failed']}")
         if self.stats['archived'] > 0:
-            print(f"Jobs archives:  {self.stats['archived']} (donnees non disponibles)")
+            print(f"Archived jobs:    {self.stats['archived']} (data unavailable)")
 
         if self.start_time:
             elapsed = time.time() - self.start_time
             hours = int(elapsed // 3600)
             minutes = int((elapsed % 3600) // 60)
             seconds = int(elapsed % 60)
-            print(f"\n Temps total: {hours}h {minutes}m {seconds}s")
+            print(f"\nTotal time:       {hours}h {minutes}m {seconds}s")
 
             if self.stats['downloaded'] > 0:
                 avg = elapsed / self.stats['downloaded']
-                print(f" Moyenne/CV:  {avg:.1f}s")
+                print(f"Avg/CV:           {avg:.1f}s")
 
         print("=" * 60)
 
@@ -1759,7 +1773,7 @@ class IndeedDownloader:
 
     def _generate_report(self):
         """Generate a summary report file by scanning all job folders in downloads"""
-        report_file = Path(self.download_folder) / 'rapport_telechargement.txt'
+        report_file = Path(self.download_folder) / 'download_report.txt'
         timestamp = datetime.now().strftime('%d-%m-%Y %H:%M:%S')
 
         # Scan all job folders in downloads
@@ -1789,7 +1803,7 @@ class IndeedDownloader:
                 })
 
         if not job_folders:
-            print("Aucun dossier job trouve dans downloads/")
+            print("No job folder found in downloads/")
             return
 
         # Calculate totals
@@ -1801,15 +1815,15 @@ class IndeedDownloader:
 
         with open(report_file, 'w', encoding='utf-8') as f:
             f.write("=" * 70 + "\n")
-            f.write("RAPPORT GLOBAL - INDEED CV DOWNLOADER\n")
+            f.write("GLOBAL REPORT - INDEED CV DOWNLOADER\n")
             f.write("=" * 70 + "\n")
             f.write(f"Date: {timestamp}\n")
-            f.write(f"Dossiers job: {len(job_folders)}\n")
+            f.write(f"Job folders: {len(job_folders)}\n")
             f.write("\n")
 
             # Per-job stats
             f.write("-" * 70 + "\n")
-            f.write("DETAIL PAR JOB\n")
+            f.write("PER-JOB DETAILS\n")
             f.write("-" * 70 + "\n\n")
 
             for i, job in enumerate(job_folders, 1):
@@ -1818,29 +1832,29 @@ class IndeedDownloader:
                     announced = job['stats'].get('total_announced', 0)
                     recovered = job['stats'].get('total_recovered', 0)
                     archived = announced - recovered
-                    f.write(f"   Candidats annonces: {announced}\n")
-                    f.write(f"   Candidats recuperes:{recovered}\n")
+                    f.write(f"   Candidates posted:   {announced}\n")
+                    f.write(f"   Candidates fetched:  {recovered}\n")
                     if archived > 0:
-                        f.write(f"   Archives/perdus:    {archived}\n")
-                f.write(f"   CVs telecharges:    {job['pdf_count']}\n")
+                        f.write(f"   Archived/lost:       {archived}\n")
+                f.write(f"   CVs downloaded:      {job['pdf_count']}\n")
                 if job['no_cv_count'] > 0:
-                    f.write(f"   Sans CV:            {job['no_cv_count']}\n")
+                    f.write(f"   Without CV:          {job['no_cv_count']}\n")
                 f.write("\n")
 
             # Summary
             f.write("-" * 70 + "\n")
-            f.write("RESUME GLOBAL\n")
+            f.write("GLOBAL SUMMARY\n")
             f.write("-" * 70 + "\n")
             f.write(f"Total jobs:            {len(job_folders)}\n")
-            f.write(f"Candidats annonces:    {total_announced}\n")
-            f.write(f"Candidats recuperes:   {total_recovered}\n")
+            f.write(f"Candidates posted:     {total_announced}\n")
+            f.write(f"Candidates fetched:    {total_recovered}\n")
             if total_archived > 0:
-                f.write(f"Archives/perdus:       {total_archived}\n")
-            f.write(f"CVs telecharges:       {total_pdfs}\n")
-            f.write(f"Sans CV:               {total_no_cv}\n")
+                f.write(f"Archived/lost:         {total_archived}\n")
+            f.write(f"CVs downloaded:        {total_pdfs}\n")
+            f.write(f"Without CV:            {total_no_cv}\n")
             f.write("=" * 70 + "\n")
 
-        print(f"\nRapport genere: {report_file}")
+        print(f"\nReport generated: {report_file}")
 
     def run(self):
         """Main execution"""
@@ -1863,17 +1877,17 @@ class IndeedDownloader:
             self.print_statistics()
 
         except KeyboardInterrupt:
-            print("\n\n⚠️ Interrompu par l'utilisateur")
+            print("\n\n⚠️ Interrupted by user")
             self.print_statistics()
 
         except Exception as e:
-            print(f"\n❌ Erreur: {e}")
+            print(f"\n❌ Error: {e}")
             import traceback
             traceback.print_exc()
 
         finally:
             if self.driver:
-                input("\nAppuyez sur Entrée pour fermer Chrome...")
+                input("\nPress Enter to close Chrome...")
                 self.driver.quit()
 
 
