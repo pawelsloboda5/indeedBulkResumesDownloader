@@ -1051,18 +1051,47 @@ class IndeedDownloader:
         except Exception:
             return None
 
+    # Indeed has shipped several variants of this control across redesigns
+    # and locales (anchor vs button, exact text vs nested span, icon-only).
+    # Try selectors in order; first hit wins.
+    _DOWNLOAD_BUTTON_SELECTORS = [
+        # Stable attributes Indeed uses for testability
+        "//*[@data-testid='download-resume' or @data-testid='download-cv']",
+        "//*[contains(@data-testid, 'download') and (self::a or self::button)]",
+        "//a[contains(@aria-label, 'Download') or contains(@aria-label, 'Télécharger')]",
+        "//button[contains(@aria-label, 'Download') or contains(@aria-label, 'Télécharger')]",
+        # Text-based, case-insensitive, ignoring nested spans/icons
+        "//a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'download resume')]",
+        "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'download resume')]",
+        "//a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'download cv')]",
+        "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'download cv')]",
+        "//a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'télécharger')]",
+        "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'télécharger')]",
+        # Direct download links to Indeed's resume endpoint
+        "//a[contains(@href, '/api/catws/resume') or contains(@href, '/resume/v2/download')]",
+    ]
+
+    def _find_download_button(self):
+        """Try each selector until one matches; return the element or None."""
+        for selector in self._DOWNLOAD_BUTTON_SELECTORS:
+            try:
+                el = WebDriverWait(self.driver, 1).until(
+                    EC.presence_of_element_located((By.XPATH, selector))
+                )
+                if el:
+                    return el
+            except TimeoutException:
+                continue
+        return None
+
     def _download_cv_frontend(self, name: str) -> bool:
         """Download CV using click"""
         try:
-            # Find download button
             for attempt in range(3):
                 try:
-                    download_link = WebDriverWait(self.driver, 5).until(
-                        EC.presence_of_element_located((
-                            By.XPATH,
-                            "//a[text()='Download resume' or text()='Télécharger le CV']"
-                        ))
-                    )
+                    download_link = self._find_download_button()
+                    if not download_link:
+                        return False
                     self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", download_link)
                     time.sleep(0.2)
                     self.driver.execute_script("arguments[0].click();", download_link)
@@ -1071,18 +1100,15 @@ class IndeedDownloader:
                     if attempt == 2:
                         return False
                     time.sleep(0.5)
-                except TimeoutException:
-                    return False
 
             time.sleep(self.download_delay)
 
-            # Verify and rename file
             if self._verify_and_rename_download(name):
                 self._save_checkpoint(name=name)
                 return True
             return False
 
-        except Exception as e:
+        except Exception:
             return False
 
     def _verify_and_rename_download(self, name: str) -> bool:
