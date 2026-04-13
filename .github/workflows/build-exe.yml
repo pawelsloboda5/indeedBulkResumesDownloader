@@ -1,0 +1,32 @@
+name: Build Windows .exe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller==6.3.0
+
+      - name: Build
+        run: pyinstaller --onefile --name IndeedCVDownloader --noconfirm indeed_downloader.py
+
+      - name: Hash the artifact (SHA-256)
+        run: certutil -hashfile dist\IndeedCVDownloader.exe SHA256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IndeedCVDownloader
+          path: dist/IndeedCVDownloader.exe
+          retention-days: 30
