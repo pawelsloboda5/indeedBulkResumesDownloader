@@ -23,7 +23,6 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException, StaleElementReferenceException
-import chromedriver_autoinstaller
 from tqdm import tqdm
 
 # Load environment variables
@@ -184,8 +183,6 @@ class IndeedDownloader:
     def _init_chrome(self):
         """Initialize Chrome browser with options"""
         print("🌐 Opening Chrome...")
-
-        chromedriver_autoinstaller.install()
 
         chrome_options = Options()
         chrome_options.add_argument('--disable-blink-features=AutomationControlled')
