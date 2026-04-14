@@ -66,7 +66,8 @@ class IndeedDownloader:
             'downloaded': 0,
             'skipped': 0,
             'failed': 0,
-            'archived': 0  # Jobs with no candidates (too old/archived)
+            'archived': 0,  # Jobs with no candidates (too old/archived)
+            'app_data_downloaded': 0,  # Candidates with successful application-data download
         }
         self.job_stats = []  # List of {job_name, downloaded, skipped, no_cv, total}
         self.start_time = None
@@ -75,24 +76,48 @@ class IndeedDownloader:
         self.mode = None  # 'backend' or 'frontend'
         self.job_mode = None  # 'single' or 'all'
         self.job_statuses = []  # ['ACTIVE', 'PAUSED', 'CLOSED']
+        self.download_app_data = True  # Download screener-question HTML + raw JSON alongside CV
 
     def _load_checkpoint(self) -> dict:
-        """Load checkpoint data"""
-        if self.checkpoint_file.exists():
-            with open(self.checkpoint_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        return {
+        """Load checkpoint data.
+
+        Merges in any missing keys so older checkpoint files (written before
+        downloaded_application_data existed) keep working without manual fixup.
+        """
+        default = {
             'downloaded_names': [],
             'downloaded_ids': [],
-            'completed_jobs': []
+            'completed_jobs': [],
+            'downloaded_application_data': [],
         }
+        if self.checkpoint_file.exists():
+            with open(self.checkpoint_file, 'r', encoding='utf-8') as f:
+                loaded = json.load(f)
+            # Merge defaults for any keys the old checkpoint didn't know about
+            for k, v in default.items():
+                if k not in loaded:
+                    loaded[k] = v
+            return loaded
+        return default
 
-    def _save_checkpoint(self, name: str = None, legacy_id: str = None, job_id: str = None):
-        """Save checkpoint"""
-        if name and name not in self.checkpoint_data['downloaded_names']:
-            self.checkpoint_data['downloaded_names'].append(name)
-        if legacy_id and legacy_id not in self.checkpoint_data['downloaded_ids']:
-            self.checkpoint_data['downloaded_ids'].append(legacy_id)
+    def _save_checkpoint(self, name: str = None, legacy_id: str = None, job_id: str = None, app_data: bool = False):
+        """Save checkpoint.
+
+        Args:
+            name: candidate display name (added to CV dedup unless app_data=True)
+            legacy_id: candidate legacy ID (added to CV dedup)
+            job_id: job ID to mark complete
+            app_data: if True, `name` is recorded against the app-data dedup list
+                      instead of the CV list. Independent from CV state.
+        """
+        if app_data:
+            if name and name not in self.checkpoint_data['downloaded_application_data']:
+                self.checkpoint_data['downloaded_application_data'].append(name)
+        else:
+            if name and name not in self.checkpoint_data['downloaded_names']:
+                self.checkpoint_data['downloaded_names'].append(name)
+            if legacy_id and legacy_id not in self.checkpoint_data['downloaded_ids']:
+                self.checkpoint_data['downloaded_ids'].append(legacy_id)
         if job_id and job_id not in self.checkpoint_data['completed_jobs']:
             self.checkpoint_data['completed_jobs'].append(job_id)
 
@@ -172,11 +197,29 @@ class IndeedDownloader:
                 print("❌ Invalid choice")
 
         print()
+        print("📎 APPLICATION DATA:")
+        print("   1. Yes - Download application data (screener questions + raw JSON)")
+        print("   2. No - CVs only")
+        print()
+
+        while True:
+            choice = input("Choice (1/2): ").strip()
+            if choice == '1':
+                self.download_app_data = True
+                break
+            elif choice == '2':
+                self.download_app_data = False
+                break
+            else:
+                print("❌ Invalid choice")
+
+        print()
         print("=" * 60)
         print(f"✅ Mode: {self.mode.upper()}")
         print(f"✅ Jobs: {'Single' if self.job_mode == 'single' else 'All'}")
         if self.job_mode == 'all':
             print(f"✅ Statuses: {', '.join(self.job_statuses)}")
+        print(f"✅ App data: {'Yes' if self.download_app_data else 'No'}")
         print("=" * 60)
         print()
 
@@ -463,7 +506,7 @@ class IndeedDownloader:
         job_folder = Path(self.download_folder) / folder_name
 
         # Check if folder already exists (has PDFs)
-        self.current_job_is_existing = job_folder.exists() and any(job_folder.glob('*.pdf'))
+        self.current_job_is_existing = job_folder.exists() and any(job_folder.rglob('*.pdf'))
 
         job_folder.mkdir(exist_ok=True)
 
@@ -641,12 +684,8 @@ class IndeedDownloader:
 
             pdf_data = base64.b64decode(base64_data)
 
-            safe_name = "".join(c for c in name if c.isalnum() or c in (' ', '-', '_')).strip()
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = f"{safe_name}_{timestamp}.pdf"
-
-            folder = self.current_job_folder or Path(self.download_folder)
-            filepath = folder / filename
+            candidate_folder = self._create_candidate_folder(name)
+            filepath = candidate_folder / "resume.pdf"
 
             with open(filepath, 'wb') as f:
                 f.write(pdf_data)
@@ -716,7 +755,7 @@ class IndeedDownloader:
         # Scan existing PDF files to get names (only for existing jobs with new candidates)
         if scan_pdfs:
             print("   Scanning existing CVs...")
-            for pdf_file in self.current_job_folder.glob('*.pdf'):
+            for pdf_file in self.current_job_folder.rglob('*.pdf'):
                 # Format: "Jean Dupont_20251126_154317.pdf"
                 name_part = pdf_file.stem.rsplit('_', 2)[0]  # Get "Jean Dupont"
                 if name_part:
@@ -899,7 +938,7 @@ class IndeedDownloader:
         processed_names = set()
         if self.current_job_folder and self.current_job_folder.exists():
             # Scan PDF files
-            for pdf_file in self.current_job_folder.glob('*.pdf'):
+            for pdf_file in self.current_job_folder.rglob('*.pdf'):
                 # Format: "Jean Dupont_20251126_154317.pdf"
                 name_part = pdf_file.stem.rsplit('_', 2)[0]  # Get "Jean Dupont"
                 if name_part:
@@ -1006,7 +1045,12 @@ class IndeedDownloader:
         self._download_all_candidates_frontend()
 
     def _download_all_candidates_frontend(self):
-        """Download candidates using Selenium clicks"""
+        """Download candidates using Selenium clicks.
+
+        For each candidate: compute the candidate folder up front, run the
+        CV download (dedup'd on name), then — if the user opted in to it —
+        run the application-data flow (independently dedup'd).
+        """
         print("\n🚀 Downloading via Selenium...\n")
 
         pbar = tqdm(desc="CVs")
@@ -1018,15 +1062,30 @@ class IndeedDownloader:
             if not name:
                 break
 
-            # Check if already downloaded
+            # Always compute the candidate folder — CV flow and app-data flow
+            # both need it, and mkdir is idempotent.
+            candidate_folder = self._create_candidate_folder(name)
+
+            # Check if already downloaded (CV dedup)
             if name in self.checkpoint_data['downloaded_names']:
                 self.stats['skipped'] += 1
             else:
                 # Download CV
-                if self._download_cv_frontend(name):
+                if self._download_cv_frontend(name, candidate_folder):
                     self.stats['downloaded'] += 1
                 else:
                     self.stats['failed'] += 1
+
+            # Application-data flow is independent of the CV dedup: it may
+            # run even for a candidate whose CV was skipped (already done
+            # in a previous run), so HR can backfill app data later.
+            if self.download_app_data and name not in self.checkpoint_data.get('downloaded_application_data', []):
+                if self._download_application_data_frontend(name, candidate_folder):
+                    self._save_checkpoint(name=name, app_data=True)
+                    self.stats['app_data_downloaded'] += 1
+                    print(f"✅ App data saved for {name}")
+                else:
+                    print(f"⚠️ App data click failed for {name}")
 
             self.stats['total_processed'] += 1
             count += 1
@@ -1071,11 +1130,16 @@ class IndeedDownloader:
         "//a[contains(@href, '/api/catws/resume') or contains(@href, '/resume/v2/download')]",
     ]
 
-    def _find_download_button(self):
-        """Try each selector until one matches; return the element or None."""
-        for selector in self._DOWNLOAD_BUTTON_SELECTORS:
+    def _find_element_by_selectors(self, selectors, timeout_per: float = 1.0):
+        """Try each XPath selector in order; return the first match or None.
+
+        Single wait-per-selector helper used everywhere Selenium needs to
+        locate an element from a fallback chain (Indeed ships multiple
+        variants across redesigns). Keeps the call sites uniform.
+        """
+        for selector in selectors:
             try:
-                el = WebDriverWait(self.driver, 1).until(
+                el = WebDriverWait(self.driver, timeout_per).until(
                     EC.presence_of_element_located((By.XPATH, selector))
                 )
                 if el:
@@ -1084,8 +1148,57 @@ class IndeedDownloader:
                 continue
         return None
 
-    def _download_cv_frontend(self, name: str) -> bool:
-        """Download CV using click"""
+    def _find_download_button(self):
+        """Try each selector until one matches; return the element or None."""
+        return self._find_element_by_selectors(self._DOWNLOAD_BUTTON_SELECTORS)
+
+    # Selector chains for the "..." (kebab) more-options menu on a candidate
+    # profile, and the subsequent "Download application data" modal flow.
+    # Plan-provided best-effort guesses; HR may refine these after tomorrow's
+    # DevTools capture.
+    _KEBAB_MENU_SELECTORS = [
+        "//button[@data-testid='candidate-actions-menu' or @data-testid='more-options' or @data-testid='kebab-menu' or @data-testid='candidate-kebab']",
+        "//button[contains(@aria-label, 'More options') or contains(@aria-label, 'More actions') or contains(@aria-label, 'Actions')]",
+        "//button[@aria-haspopup='menu' or @aria-haspopup='true']",
+        # Kebab/three-dot heuristic: button with a visible '…' or stacked dots icon
+        "//button[.//*[name()='svg' and (contains(@aria-label, 'more') or contains(@aria-label, 'More'))]]",
+    ]
+
+    _APP_DATA_MENU_ITEM_SELECTORS = [
+        "//*[@role='menuitem' and contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'download application data')]",
+        "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'download application data')]",
+        "//a[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'download application data')]",
+        "//li[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'download application data')]",
+    ]
+
+    _APP_DATA_MODAL_SELECTORS = [
+        "//div[@role='dialog' and .//*[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'download application data')]]",
+        "//*[contains(@class, 'modal')][.//*[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'download application data')]]",
+    ]
+
+    _APP_DATA_CONFIRM_SELECTORS = [
+        "//button[@data-testid='download-files-button' or @data-testid='confirm-download' or @data-testid='download-files']",
+        "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'download files')]",
+        "//div[@role='dialog']//button[@type='submit']",
+    ]
+
+    def _create_candidate_folder(self, name: str) -> Path:
+        """Return (and create) downloads/<job>/<safe candidate name>/.
+
+        Sanitization matches the other places that clean a candidate name:
+        keep alphanumerics, spaces, dashes, underscores; strip everything else.
+        Falls back to 'unknown' if the cleaned name ends up empty.
+        """
+        safe_name = "".join(c for c in name if c.isalnum() or c in (' ', '-', '_')).strip()
+        if not safe_name:
+            safe_name = "unknown"
+        base = self.current_job_folder or Path(self.download_folder)
+        folder = base / safe_name
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder
+
+    def _download_cv_frontend(self, name: str, candidate_folder: Path) -> bool:
+        """Download CV using click, then move the PDF into candidate_folder."""
         try:
             for attempt in range(3):
                 try:
@@ -1103,7 +1216,7 @@ class IndeedDownloader:
 
             time.sleep(self.download_delay)
 
-            if self._verify_and_rename_download(name):
+            if self._verify_and_rename_download(name, candidate_folder):
                 self._save_checkpoint(name=name)
                 return True
             return False
@@ -1111,23 +1224,188 @@ class IndeedDownloader:
         except Exception:
             return False
 
-    def _verify_and_rename_download(self, name: str) -> bool:
-        """Verify download and rename file"""
-        folder = self.current_job_folder or Path(self.download_folder)
+    def _verify_and_rename_download(self, name: str, candidate_folder: Path) -> bool:
+        """Verify the CV download and move it into the candidate's folder.
+
+        Chrome is configured once at init to drop files into the job folder,
+        so we glob the *job* folder (not the candidate folder) and move the
+        fresh PDF to `<candidate_folder>/resume.pdf`.
+        """
+        # The job folder is where Chrome actually writes the download.
+        job_folder = self.current_job_folder or Path(self.download_folder)
 
         for _ in range(10):
-            files = list(folder.glob("*.pdf"))
+            files = list(job_folder.glob("*.pdf"))
             for f in files:
+                # Ignore any PDF already renamed into a candidate subfolder
+                # (glob on the job folder only returns top-level pdfs anyway).
                 if f.stat().st_size > 1000 and name.split()[0].lower() not in f.name.lower():
-                    # Rename file
-                    safe_name = "".join(c for c in name if c.isalnum() or c in (' ', '-', '_')).strip()
-                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                    new_name = folder / f"{safe_name}_{timestamp}.pdf"
-                    f.rename(new_name)
+                    target = candidate_folder / "resume.pdf"
+                    # Overwrite any existing resume.pdf (idempotent rerun)
+                    if target.exists():
+                        try:
+                            target.unlink()
+                        except OSError:
+                            pass
+                    f.rename(target)
                     return True
             time.sleep(0.5)
 
         return False
+
+    def _check_app_data_box(self, pattern_regex: str, modal) -> bool:
+        """Find a row in `modal` whose text matches `pattern_regex` (case-insensitive)
+        and tick the checkbox inside it. Supports both native <input type=checkbox>
+        and role=checkbox styled buttons."""
+        js = """
+        const modal = arguments[0];
+        const re = new RegExp(arguments[1], 'i');
+        const rows = modal.querySelectorAll('li, div, label, tr');
+        for (const row of rows) {
+            if (re.test(row.textContent || '')) {
+                const cb = row.querySelector('input[type="checkbox"], [role="checkbox"]');
+                if (cb) {
+                    if (cb.tagName === 'INPUT') {
+                        if (!cb.checked) cb.click();
+                        return !!cb.checked;
+                    } else {
+                        if (cb.getAttribute('aria-checked') !== 'true') cb.click();
+                        return cb.getAttribute('aria-checked') === 'true';
+                    }
+                }
+            }
+        }
+        return false;
+        """
+        try:
+            return bool(self.driver.execute_script(js, modal, pattern_regex))
+        except Exception:
+            return False
+
+    def _download_application_data_frontend(self, name: str, candidate_folder: Path) -> bool:
+        """Automate the "..." -> Download application data -> check boxes -> Download files flow."""
+        try:
+            kebab = self._find_element_by_selectors(self._KEBAB_MENU_SELECTORS, timeout_per=1.5)
+            if not kebab:
+                return False
+            self.driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center'}); arguments[0].click();", kebab
+            )
+            time.sleep(0.4)
+
+            item = self._find_element_by_selectors(self._APP_DATA_MENU_ITEM_SELECTORS, timeout_per=1.5)
+            if not item:
+                try:
+                    self.driver.execute_script("document.body.click();")
+                except Exception:
+                    pass
+                return False
+            self.driver.execute_script("arguments[0].click();", item)
+            time.sleep(0.5)
+
+            modal = self._find_element_by_selectors(self._APP_DATA_MODAL_SELECTORS, timeout_per=3)
+            if not modal:
+                try:
+                    self.driver.execute_script("document.body.click();")
+                except Exception:
+                    pass
+                return False
+
+            # Tick HTML + JSON; skip PDF (already downloaded as the resume).
+            html_ok = self._check_app_data_box(r'-original-application\.html|original-application', modal)
+            json_ok = self._check_app_data_box(r'cao_post_body', modal)
+            if not (html_ok and json_ok):
+                try:
+                    self.driver.execute_script("document.body.click();")
+                except Exception:
+                    pass
+                return False
+
+            confirm = self._find_element_by_selectors(self._APP_DATA_CONFIRM_SELECTORS, timeout_per=1.5)
+            if not confirm:
+                try:
+                    self.driver.execute_script("document.body.click();")
+                except Exception:
+                    pass
+                return False
+            self.driver.execute_script("arguments[0].click();", confirm)
+
+            return self._move_application_files(name, candidate_folder)
+
+        except Exception:
+            try:
+                self.driver.execute_script("document.body.click();")
+            except Exception:
+                pass
+            return False
+
+    def _move_application_files(self, name: str, candidate_folder: Path) -> bool:
+        """Wait for Chrome to drop the two app-data files in the job folder,
+        then move + rename them into the candidate folder as
+        application.html and application.json. Returns True iff BOTH arrived.
+
+        Snapshots the set of matching files already present in the job folder
+        at call time (e.g., stragglers from a previous candidate whose download
+        was still streaming) so we don't misattribute them to this candidate.
+        """
+        job_folder = self.current_job_folder or Path(self.download_folder)
+        html_target = candidate_folder / "application.html"
+        json_target = candidate_folder / "application.json"
+
+        def _find_html_matches():
+            return (
+                list(job_folder.glob("*-original-application.HTML"))
+                + list(job_folder.glob("*-original-application.html"))
+                + list(job_folder.glob("*.HTML"))
+            )
+
+        def _find_json_matches():
+            return (
+                list(job_folder.glob("cao_post_body_*.json"))
+                + list(job_folder.glob("cao_post_body*.json"))
+            )
+
+        # Snapshot pre-existing matching files to exclude them from "just arrived".
+        pre_existing_html = set(_find_html_matches())
+        pre_existing_json = set(_find_json_matches())
+
+        html_found = html_target.exists()
+        json_found = json_target.exists()
+
+        for _ in range(30):  # up to ~15s
+            if not html_found:
+                for f in _find_html_matches():
+                    if f in pre_existing_html:
+                        continue
+                    if f.is_file() and f.stat().st_size > 0:
+                        try:
+                            if html_target.exists():
+                                html_target.unlink()
+                            f.rename(html_target)
+                            html_found = True
+                            break
+                        except OSError:
+                            pass
+
+            if not json_found:
+                for f in _find_json_matches():
+                    if f in pre_existing_json:
+                        continue
+                    if f.is_file() and f.stat().st_size > 0:
+                        try:
+                            if json_target.exists():
+                                json_target.unlink()
+                            f.rename(json_target)
+                            json_found = True
+                            break
+                        except OSError:
+                            pass
+
+            if html_found and json_found:
+                return True
+            time.sleep(0.5)
+
+        return html_found and json_found
 
     def _go_to_next_candidate(self) -> bool:
         """Navigate to next candidate"""
@@ -1465,7 +1743,7 @@ class IndeedDownloader:
                         total_recovered = stats.get('total_recovered', cv_count)
                     else:
                         # Fallback: count PDFs + no_cv.txt entries
-                        cv_count = len(list(folder.glob('*.pdf')))
+                        cv_count = len(list(folder.rglob('*.pdf')))
                         no_cv_file = folder / 'no_cv.txt'
                         if no_cv_file.exists():
                             with open(no_cv_file, 'r', encoding='utf-8') as f:
@@ -1490,7 +1768,7 @@ class IndeedDownloader:
                         total_recovered = stats.get('total_recovered', cv_count)
                     else:
                         # Fallback: count PDFs + no_cv.txt entries
-                        cv_count = len(list(folder.glob('*.pdf')))
+                        cv_count = len(list(folder.rglob('*.pdf')))
                         no_cv_file = folder / 'no_cv.txt'
                         if no_cv_file.exists():
                             with open(no_cv_file, 'r', encoding='utf-8') as f:
@@ -1775,6 +2053,8 @@ class IndeedDownloader:
         print(f"Downloaded:       {self.stats['downloaded']}")
         print(f"Skipped:          {self.stats['skipped']}")
         print(f"Failed:           {self.stats['failed']}")
+        if self.stats.get('app_data_downloaded', 0) > 0:
+            print(f"App data saved:   {self.stats['app_data_downloaded']}")
         if self.stats['archived'] > 0:
             print(f"Archived jobs:    {self.stats['archived']} (data unavailable)")
 
@@ -1806,7 +2086,7 @@ class IndeedDownloader:
         for folder in sorted(download_path.iterdir()):
             if folder.is_dir():
                 # Count PDFs
-                pdf_count = len(list(folder.glob('*.pdf')))
+                pdf_count = len(list(folder.rglob('*.pdf')))
 
                 # Count no_cv.txt entries
                 no_cv_count = 0
