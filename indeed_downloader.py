@@ -605,8 +605,25 @@ class IndeedDownloader:
   }
 }"""
 
+        # Cover every Indeed pipeline state, including post-active ones like
+        # REJECTED / WITHDRAWN / HIRED. The Indeed dashboard's "All" view
+        # includes these and the tool's purpose is bulk export (not filtering
+        # by pipeline state), so we cast the widest net by default. If a value
+        # turns out to be invalid in Indeed's schema, the server will surface
+        # it as a GraphQL error, which the logging below will print.
         if dispositions is None:
-            dispositions = ["NEW", "PENDING", "PHONE_SCREENED", "INTERVIEWED", "OFFER_MADE", "REVIEWED"]
+            dispositions = [
+                "NEW",
+                "PENDING",
+                "PHONE_SCREENED",
+                "INTERVIEWED",
+                "OFFER_MADE",
+                "REVIEWED",
+                "REJECTED",
+                "AUTO_REJECTED",
+                "WITHDRAWN",
+                "HIRED",
+            ]
 
         surface_context = [{"contextKey": "DISPOSITION", "contextPayload": d} for d in dispositions]
         surface_context.append({"contextKey": "SORT_BY", "contextPayload": sort_by})
@@ -631,6 +648,12 @@ class IndeedDownloader:
 
         payload = {"operationName": "FindRCPMatches", "variables": variables, "query": query}
 
+        # One-time query-shape log per pagination run, to aid diagnosis without
+        # being noisy. Printed only on offset=0.
+        if offset == 0:
+            ids = variables["input"].get("identifiers", {})
+            print(f"   🔎 Query: jobIdentifiers={ids or '{} (all jobs)'}, dispositions={len(dispositions)}, limit={limit}")
+
         js_code = f"""
         return await fetch("https://apis.indeed.com/graphql?co=US&locale=en-US", {{
             method: "POST",
@@ -649,7 +672,14 @@ class IndeedDownloader:
 
         try:
             result = self.driver.execute_script(js_code)
-            if not result or 'errors' in result:
+            if not result:
+                print(f"   ⚠ GraphQL returned no response (auth may have expired)")
+                return [], 0, False
+            if 'errors' in result:
+                print(f"   ⚠ GraphQL errors from Indeed:")
+                for err in (result.get('errors') or [])[:3]:
+                    msg = err.get('message', str(err)) if isinstance(err, dict) else str(err)
+                    print(f"      • {msg}")
                 return [], 0, False
 
             rcp = result.get('data', {}).get('findRCPMatches', {}) or {}
@@ -657,6 +687,8 @@ class IndeedDownloader:
             matches = conn.get('matches', []) or []
             total = rcp.get('overallMatchCount', 0) or 0
             has_next_page = bool((conn.get('pageInfo') or {}).get('hasNextPage'))
+            if offset == 0:
+                print(f"   🔎 Server returned: overallMatchCount={total}, matches_on_page={len(matches)}, hasNextPage={has_next_page}")
             return matches, total, has_next_page
         except Exception as e:
             print(f"❌ API error: {e}")
@@ -729,6 +761,15 @@ class IndeedDownloader:
 
         job_url = self.driver.current_url
         self.current_job_id = self._extract_job_id_from_url(job_url)
+
+        # Diagnostic snapshot — prints once per run, helps trace any
+        # "0 candidates" failure to its actual cause (bad URL extraction,
+        # missing auth token, wrong scope, etc).
+        print(f"\n🔎 Diagnostics:")
+        print(f"   URL: {job_url}")
+        print(f"   Extracted job IRI: {self.current_job_id or '(none — query will cover ALL jobs)'}")
+        print(f"   API key: {self.api_key[:12] + '...' if self.api_key else '(MISSING — auth may have failed)'}")
+        print(f"   CTK:     {self.ctk or '(MISSING — auth may have failed)'}")
 
         # Get job name from page
         try:
@@ -866,8 +907,21 @@ class IndeedDownloader:
         """
         print("\nFetching candidates via API...")
 
-        # All disposition types
-        all_dispositions = ["NEW", "PENDING", "PHONE_SCREENED", "INTERVIEWED", "OFFER_MADE", "REVIEWED"]
+        # All disposition types — widened to include post-active states so
+        # the multi-pass downloader's "fetch everything" semantics actually
+        # return everyone, not just candidates still in the active pipeline.
+        all_dispositions = [
+            "NEW",
+            "PENDING",
+            "PHONE_SCREENED",
+            "INTERVIEWED",
+            "OFFER_MADE",
+            "REVIEWED",
+            "REJECTED",
+            "AUTO_REJECTED",
+            "WITHDRAWN",
+            "HIRED",
+        ]
         all_candidates = {}  # key: legacy_id, value: candidate dict
 
         # Pass 1: Sort by date DESC (default)
