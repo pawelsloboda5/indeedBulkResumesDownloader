@@ -605,25 +605,13 @@ class IndeedDownloader:
   }
 }"""
 
-        # Cover every Indeed pipeline state, including post-active ones like
-        # REJECTED / WITHDRAWN / HIRED. The Indeed dashboard's "All" view
-        # includes these and the tool's purpose is bulk export (not filtering
-        # by pipeline state), so we cast the widest net by default. If a value
-        # turns out to be invalid in Indeed's schema, the server will surface
-        # it as a GraphQL error, which the logging below will print.
+        # The 6 active-pipeline dispositions — proven to work by live
+        # capture. Post-active states (REJECTED / WITHDRAWN / HIRED /
+        # AUTO_REJECTED) are fetched SEPARATELY in isolated passes by
+        # _download_all_candidates_api so a single rejected enum value can't
+        # blow up the entire run with AllMatchProvidersFailedException.
         if dispositions is None:
-            dispositions = [
-                "NEW",
-                "PENDING",
-                "PHONE_SCREENED",
-                "INTERVIEWED",
-                "OFFER_MADE",
-                "REVIEWED",
-                "REJECTED",
-                "AUTO_REJECTED",
-                "WITHDRAWN",
-                "HIRED",
-            ]
+            dispositions = ["NEW", "PENDING", "PHONE_SCREENED", "INTERVIEWED", "OFFER_MADE", "REVIEWED"]
 
         surface_context = [{"contextKey": "DISPOSITION", "contextPayload": d} for d in dispositions]
         surface_context.append({"contextKey": "SORT_BY", "contextPayload": sort_by})
@@ -771,14 +759,37 @@ class IndeedDownloader:
         print(f"   API key: {self.api_key[:12] + '...' if self.api_key else '(MISSING — auth may have failed)'}")
         print(f"   CTK:     {self.ctk or '(MISSING — auth may have failed)'}")
 
-        # Get job name from page
+        # Get job name from page. The first selector the page exposes may be
+        # the generic "Candidates" h1 (not the job title) depending on which
+        # subpage HR navigated to; in that case we fall back to a stable
+        # label derived from the job's UUID so different jobs don't collide
+        # into one folder.
         try:
             job_name = self.driver.execute_script("""
                 const el = document.querySelector('[data-testid="job-title"]') ||
                            document.querySelector('h1') ||
                            document.querySelector('.job-title');
-                return el ? el.textContent.trim() : 'Job';
+                return el ? el.textContent.trim() : '';
             """)
+        except Exception:
+            job_name = ''
+
+        generic_names = {'', 'candidates', 'applicants', 'all candidates', 'job'}
+        if (job_name or '').strip().lower() in generic_names:
+            fallback = 'Job_unknown'
+            if self.current_job_id:
+                try:
+                    # selectedJobs is base64-encoded `iri://apis.indeed.com/EmployerJob/<uuid>`
+                    decoded = base64.b64decode(self.current_job_id + '===').decode('utf-8', errors='ignore')
+                    uuid_tail = decoded.rsplit('/', 1)[-1][:8]
+                    if uuid_tail:
+                        fallback = f"Job_{uuid_tail}"
+                except Exception:
+                    pass
+            print(f"   (page title was generic — using fallback folder name '{fallback}')")
+            job_name = fallback
+
+        try:
             self._create_job_folder(job_name)
             print(f"📁 Folder: {self.current_job_folder}")
         except Exception:
@@ -907,30 +918,39 @@ class IndeedDownloader:
         """
         print("\nFetching candidates via API...")
 
-        # All disposition types — widened to include post-active states so
-        # the multi-pass downloader's "fetch everything" semantics actually
-        # return everyone, not just candidates still in the active pipeline.
-        all_dispositions = [
-            "NEW",
-            "PENDING",
-            "PHONE_SCREENED",
-            "INTERVIEWED",
-            "OFFER_MADE",
-            "REVIEWED",
-            "REJECTED",
-            "AUTO_REJECTED",
-            "WITHDRAWN",
-            "HIRED",
-        ]
+        # Active-pipeline dispositions — the combination proven safe by live
+        # capture. Sent together in a single query.
+        active_dispositions = ["NEW", "PENDING", "PHONE_SCREENED", "INTERVIEWED", "OFFER_MADE", "REVIEWED"]
+
+        # Post-active dispositions — each sent in its OWN query so a single
+        # unsupported enum value produces an AllMatchProvidersFailedException
+        # on that one pass only, rather than killing the whole run.
+        extra_dispositions = ["REJECTED", "AUTO_REJECTED", "WITHDRAWN", "HIRED"]
+
+        # Full list used by the large-volume fallback (Pass 5 below).
+        all_dispositions = active_dispositions + extra_dispositions
         all_candidates = {}  # key: legacy_id, value: candidate dict
 
-        # Pass 1: Sort by date DESC (default)
-        print("   Fetching candidates...")
-        candidates, api_total = self._fetch_candidates_batch(all_dispositions, "APPLY_DATE", "DESCENDING")
+        # Pass 1: active pipeline, sort by date DESC (default view).
+        print("   Fetching candidates (active pipeline)...")
+        candidates, api_total = self._fetch_candidates_batch(active_dispositions, "APPLY_DATE", "DESCENDING")
         for c in candidates:
             if c['legacy_id'] not in all_candidates:
                 all_candidates[c['legacy_id']] = c
         print(f"      {len(all_candidates)} fetched")
+
+        # Pass 1.5: each post-active disposition in isolation. If one of
+        # these enum values is unsupported by Indeed's providers, its pass
+        # returns [] (with a logged error) and we continue with the next.
+        for d in extra_dispositions:
+            extra_candidates, extra_total = self._fetch_candidates_batch([d], "APPLY_DATE", "DESCENDING")
+            new_count = 0
+            for c in extra_candidates:
+                if c['legacy_id'] not in all_candidates:
+                    all_candidates[c['legacy_id']] = c
+                    new_count += 1
+            if new_count > 0 or extra_total > 0:
+                print(f"      +{new_count} {d} (server reported {extra_total})")
 
         # Use job_total_candidates if available (more accurate), otherwise use API total
         total_expected = job_total_candidates if job_total_candidates > 0 else api_total
