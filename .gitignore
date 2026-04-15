@@ -68,3 +68,6 @@ logs/*.json
 # Chrome driver
 chromedriver.exe
 chromedriver
+
+# DevTools network captures from HR — contain bearer tokens + session cookies
+indeed_graphql_*.txt

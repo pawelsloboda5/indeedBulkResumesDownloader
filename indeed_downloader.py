@@ -568,22 +568,36 @@ class IndeedDownloader:
     # ==================== BACKEND MODE (API) ====================
 
     def fetch_candidates_api(self, offset: int = 0, limit: int = 100, dispositions: list = None, sort_by: str = "APPLY_DATE", sort_order: str = "DESCENDING"):
-        """Fetch candidates using GraphQL API via browser"""
+        """Fetch candidates using GraphQL API via browser.
+
+        Returns (matches, total, has_next_page).
+        """
+        # legacyID lives on 5 distinct CandidateSubmission union types; missing
+        # any of them drops that candidate silently (legacyID becomes None and
+        # the downstream filter skips it). Keep all 5 in sync with the live
+        # dashboard request — see indeed_graphql_1.txt / indeed_graphql_2.txt.
         query = """query FindRCPMatches($input: OrchestrationMatchesInput!) {
   findRCPMatches(input: $input) {
     overallMatchCount
     matchConnection {
-      pageInfo { hasNextPage }
+      pageInfo { hasNextPage hasPreviousPage }
       matches {
         candidateSubmission {
           id
           data {
+            __typename
             profile { name { displayName } }
             resume {
-              ... on CandidatePdfResume { id, downloadUrl }
+              ... on CandidatePdfResume { id downloadUrl txtDownloadUrl }
+              ... on CandidateHtmlFile { id downloadUrl }
+              ... on CandidateTxtFile { id downloadUrl }
+              ... on CandidateUnrenderableFile { id downloadUrl }
             }
+            ... on LegacyCandidateSubmission { legacyID }
             ... on IndeedApplyCandidateSubmission { legacyID }
             ... on EmployerGeneratedCandidateSubmission { legacyID }
+            ... on HiddenIndeedApplyCandidateSubmission { legacyID }
+            ... on HiddenEmployerGeneratedCandidateSubmission { legacyID }
           }
         }
       }
@@ -606,8 +620,7 @@ class IndeedDownloader:
                 "offset": offset,
                 "context": {
                     "surfaceContext": surface_context
-                },
-                "searchSessionId": f"dl-{int(time.time())}-{offset}"
+                }
             }
         }
 
@@ -637,14 +650,17 @@ class IndeedDownloader:
         try:
             result = self.driver.execute_script(js_code)
             if not result or 'errors' in result:
-                return [], 0
+                return [], 0, False
 
-            matches = result.get('data', {}).get('findRCPMatches', {}).get('matchConnection', {}).get('matches', [])
-            total = result.get('data', {}).get('findRCPMatches', {}).get('overallMatchCount', 0)
-            return matches, total
+            rcp = result.get('data', {}).get('findRCPMatches', {}) or {}
+            conn = rcp.get('matchConnection', {}) or {}
+            matches = conn.get('matches', []) or []
+            total = rcp.get('overallMatchCount', 0) or 0
+            has_next_page = bool((conn.get('pageInfo') or {}).get('hasNextPage'))
+            return matches, total, has_next_page
         except Exception as e:
             print(f"❌ API error: {e}")
-            return [], 0
+            return [], 0, False
 
     def download_cv_api(self, candidate: dict) -> bool:
         """Download CV via API"""
@@ -803,7 +819,7 @@ class IndeedDownloader:
         total_announced = 0
 
         while True:
-            matches, total = self.fetch_candidates_api(
+            matches, total, has_next_page = self.fetch_candidates_api(
                 offset=offset,
                 limit=100,
                 dispositions=dispositions,
@@ -835,7 +851,7 @@ class IndeedDownloader:
                 except (KeyError, TypeError):
                     continue
 
-            if len(matches) < 100:
+            if not has_next_page:
                 break
             offset += 100
             time.sleep(0.3)
@@ -1571,12 +1587,17 @@ class IndeedDownloader:
                             if match:
                                 employer_job_id = unquote(match.group(1))
 
-                    # If still no ID, create one from title + date
+                    has_valid_api_id = bool(employer_job_id)
+
+                    # If still no ID, create a synthetic one — used ONLY for folder
+                    # naming and dedup. It must NOT be passed to the GraphQL API as
+                    # employerJobId (Indeed returns empty results silently).
                     if not employer_job_id:
                         employer_job_id = f"{clean_title}_{date_formatted}".replace(' ', '_')
 
                     jobs.append({
                         'id': employer_job_id,
+                        'has_valid_api_id': has_valid_api_id,
                         'title': title,
                         'title_clean': clean_title,
                         'status': status,
@@ -2028,6 +2049,13 @@ class IndeedDownloader:
             self._create_job_folder(job['title'], job['date'])
 
             if self.mode == 'backend':
+                # Synthetic IDs (title + date) cannot be passed to the GraphQL
+                # API as employerJobId — Indeed returns empty results silently.
+                # Skip the job so the user can fall back to Frontend mode for it.
+                if not job.get('has_valid_api_id', True):
+                    print(f"   ⚠ Skipping — no Indeed employerJobId on the jobs-table link. Use Frontend mode for this job.")
+                    self.stats['archived'] += 1
+                    continue
                 # Close any modals that might appear
                 self._close_modals()
                 self._download_all_candidates_api(job.get('total_candidates', 0))

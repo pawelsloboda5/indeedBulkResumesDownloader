@@ -8,10 +8,12 @@ We need two pieces of ground truth from her live US Indeed Employer dashboard. B
 
 **Goal:** identify the exact HTML of Indeed's "Download resume" button so we can patch the selector.
 
+**Starting page:** an **individual candidate's profile** on `employers.indeed.com` — the full-page view where she'd normally see the resume preview and the "Download resume" / "..." menu buttons. From the candidate list page, that's one click on a candidate's name/row. Do NOT run this on the candidate list page — the Download button only exists on the profile view.
+
 **Walk her through:**
 
-1. Have her open Indeed Employer in Chrome and navigate to a candidate's profile (any candidate, the one she's looking at is fine).
-2. Press **F12** (or right-click → **Inspect**) → click the **Console** tab at the top.
+1. With the candidate profile open, press **F12** (or right-click anywhere → **Inspect**) → click the **Console** tab at the top of DevTools.
+2. If there's a "Clear console" message or old output, click the 🚫 icon in the top-left of the Console to clear it (easier to read the results).
 3. Paste the entire snippet below into the Console and press Enter:
 
 ```javascript
@@ -51,13 +53,17 @@ If she sees `NO MATCHES`, she should click into the candidate's **Resume** tab (
 
 **Goal:** see the actual `operationName`, `variables`, and headers that Indeed's own dashboard sends, so we can match them in the code.
 
-**Walk her through:**
+**Starting page (important):** the **candidate list page for a job** on `employers.indeed.com` — the page that shows the table/grid of candidates with the sort dropdown and status filters across the top. NOT an individual candidate's profile, NOT the job posting editor, NOT the main dashboard home. If she's logged in and staring at one specific applicant, have her click the browser back arrow (or the job title / "Candidates" link) until she sees the list of candidates for that job.
 
-1. Same Indeed tab. Press **F12** → click the **Network** tab → in the filter box type `graphql`.
-2. Click the 🔴 record button if it isn't already red (it usually is by default).
-3. Now have her **click on a candidate, change the sort dropdown, or refresh the page** — anything that makes the dashboard load candidate data.
-4. In the Network panel, **graphql requests will appear**. They're POSTs to `apis.indeed.com/graphql`. There may be 2–10 of them.
-5. For each one, **right-click → Copy → Copy as cURL (bash)** and paste them into a text file. Send the file.
+**Walk her through (do these in order — don't skip 1 or 2):**
+
+1. On the candidate list page, press **F12** → click the **Network** tab at the top of DevTools.
+2. Tick the **Preserve log** checkbox (top row of the Network panel, next to the record button) — without this, navigating loses the captures. Also confirm the 🔴 record button is red (it almost always is by default).
+3. In the Network filter box (just below the tabs), type `graphql` to hide unrelated requests.
+4. Now switch to the **Console** tab (keep Network running in the background) and paste the fetch-monitor snippet at the bottom of this section first — that's the most reliable capture.
+5. Back on the page, trigger traffic: **change the sort dropdown** (e.g. "Most relevant" → "Newest applied") — that's the one that fires `FindRCPMatches`, the exact query our code mimics. Then for good measure, click any one candidate to open their profile, then browser-back to the list.
+6. In the Network panel, **graphql requests will appear**. They're POSTs to `apis.indeed.com/graphql`. Expect 2–10 of them.
+7. For each one, **right-click → Copy → Copy as cURL (bash)** and paste them into a text file. Send the file.
 
 If "Copy as cURL" feels intimidating, the easier version:
 1. Click any graphql row in the Network list.
@@ -126,9 +132,11 @@ The next CI build (latest commit on `main`) includes:
 
 **Goal:** see the actual network call(s) Indeed fires when HR clicks "Download files" in the application-data modal. We need this to implement Backend-mode app-data download (10× faster than Frontend for ~1000 candidates/run).
 
+**Starting page:** an **individual candidate's profile** on `employers.indeed.com` — same view as Snippet 1 (the page with the "..." button near the resume). She needs to be on the profile *before* pasting the snippet, because the snippet hooks network calls that fire the moment she clicks "Download files" in the modal.
+
 **Walk her through:**
 
-1. On a candidate profile, **F12 → Console** tab.
+1. With the candidate profile open, press **F12** → click the **Console** tab.
 2. Paste and run:
 
    ```javascript
