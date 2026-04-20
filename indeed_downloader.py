@@ -26,13 +26,165 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException, StaleElementReferenceException
 from tqdm import tqdm
+import platform
+import traceback
 
 # Load environment variables
 load_dotenv('.env.config')
 
 
+# Bumped whenever the binary layout changes. Shown in log headers so bug
+# reports are pinned to a known build.
+TOOL_VERSION = "2026-04-20-attach-mode-logging"
+
+
+class RunLogger:
+    """Per-run log file under logs/ that captures everything useful for a
+    bug report in one place. On exit we copy the active file to
+    logs/latest.log so HR only has to send one file.
+
+    Privacy: cookie values and JWT contents are never written; we log
+    names and truthy/falsy presence only.
+    """
+    def __init__(self, log_folder: Path):
+        self.log_folder = Path(log_folder)
+        self.log_folder.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.path = self.log_folder / f'run_{ts}.log'
+        self.latest_path = self.log_folder / 'latest.log'
+        # Line-buffered so tailing works and a crash loses at most one line.
+        self._f = open(self.path, 'w', encoding='utf-8', errors='replace', buffering=1)
+        self._write_header()
+
+    @property
+    def raw_file(self):
+        """File handle for _TeeStream to mirror stdout into."""
+        return self._f
+
+    def _write_header(self):
+        self._write('INFO', '=' * 70)
+        self._write('INFO', f'Indeed CV Downloader — run log')
+        self._write('INFO', f'Tool version: {TOOL_VERSION}')
+        self._write('INFO', f'Started:      {datetime.now().isoformat()}')
+        self._write('INFO', f'Python:       {sys.version.split()[0]}')
+        self._write('INFO', f'Platform:     {platform.platform()}')
+        self._write('INFO', f'CWD:          {Path.cwd()}')
+        self._write('INFO', '=' * 70)
+
+    def info(self, msg: str):
+        self._write('INFO', msg)
+
+    def warn(self, msg: str):
+        self._write('WARN', msg)
+
+    def error(self, msg: str, exc: Optional[BaseException] = None):
+        if exc is not None:
+            tb = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            msg = f'{msg}\n{tb}'
+        self._write('ERROR', msg)
+
+    def event(self, name: str, data: Optional[dict] = None):
+        """Structured event — machine-parseable for future dashboards.
+        Dicts are serialized with json (default=str) so complex values
+        (paths, exceptions) don't crash the logger."""
+        if data is None:
+            self._write('EVENT', name)
+        else:
+            try:
+                payload = json.dumps(data, default=str, ensure_ascii=False)
+            except Exception:
+                payload = repr(data)
+            self._write('EVENT', f'{name} {payload}')
+
+    def _write(self, level: str, msg: str):
+        try:
+            ts = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+            self._f.write(f'[{ts}] {level:5} {msg}\n')
+        except Exception:
+            pass
+
+    def close(self):
+        self._write('INFO', 'run_end')
+        try:
+            self._f.close()
+        except Exception:
+            pass
+        # Mirror to latest.log — this is the file HR is told to send.
+        try:
+            shutil.copy2(self.path, self.latest_path)
+        except Exception:
+            pass
+
+
+class _TeeStream:
+    """Mirrors writes to both the real stdout (so the user still sees
+    them live) and the run log file (so the .log includes everything
+    the user saw). Only attached to stdout — stderr is left alone so
+    tqdm progress bars don't flood the log with carriage-return noise."""
+    def __init__(self, original, log_file):
+        self._original = original
+        self._log_file = log_file
+
+    def write(self, data):
+        try:
+            self._original.write(data)
+        except Exception:
+            pass
+        try:
+            self._log_file.write(data)
+        except Exception:
+            pass
+
+    def flush(self):
+        for f in (self._original, self._log_file):
+            try:
+                f.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        try:
+            return self._original.isatty()
+        except Exception:
+            return False
+
+    def __getattr__(self, name):
+        return getattr(self._original, name)
+
+
+def _probe_chrome_version() -> Optional[str]:
+    """Best-effort Chrome version lookup. Helpful for "but it works on
+    my machine" bug reports. Never raises."""
+    candidates = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+    ]
+    localappdata = os.environ.get('LOCALAPPDATA')
+    if localappdata:
+        candidates.insert(0, str(Path(localappdata) / 'Google' / 'Chrome' / 'Application' / 'chrome.exe'))
+    for p in candidates:
+        if Path(p).exists():
+            try:
+                out = subprocess.check_output(
+                    [p, '--version'],
+                    stderr=subprocess.STDOUT,
+                    timeout=5,
+                )
+                return out.decode('utf-8', errors='replace').strip()
+            except Exception:
+                continue
+    return None
+
+
 class IndeedDownloader:
-    def __init__(self):
+    def __init__(self, log: Optional[RunLogger] = None):
+        # Per-run structured logger. See RunLogger. If main() didn't pass
+        # one (e.g., a library caller), fall back to a no-op-ish shim so
+        # self.log calls don't have to guard for None everywhere.
+        self.log = log
         # Config from .env
         self.download_folder = os.getenv('DOWNLOAD_FOLDER', 'downloads')
         self.log_folder = os.getenv('LOG_FOLDER', 'logs')
@@ -252,6 +404,20 @@ class IndeedDownloader:
         print(f"✅ Browser:  {'Auto (Selenium-launched)' if self.browser_launch == 'auto' else 'Attach (manual login, bypasses bot-detection)'}")
         print("=" * 60)
         print()
+
+        if self.log:
+            self.log.event('menu', {
+                'mode': self.mode,
+                'job_mode': self.job_mode,
+                'job_statuses': self.job_statuses,
+                'download_app_data': self.download_app_data,
+                'browser_launch': self.browser_launch,
+            })
+            chrome_v = _probe_chrome_version()
+            if chrome_v:
+                self.log.info(f'Detected Chrome: {chrome_v}')
+            else:
+                self.log.warn('Could not detect installed Chrome version.')
 
     # Pretend to be a stock Chrome on Windows 10. Matches what a real user's
     # browser sends and avoids the "HeadlessChrome"/automation-specific UA
@@ -520,12 +686,24 @@ class IndeedDownloader:
             self._chrome_subprocess = subprocess.Popen(cmd, **kwargs)
         except FileNotFoundError:
             print(f"❌ Could not execute {chrome_bin} — file not found or not executable.")
+            if self.log:
+                self.log.event('attach_launch', {'ok': False, 'reason': 'FileNotFoundError', 'chrome_bin': chrome_bin})
             return False
         except Exception as e:
             print(f"❌ Failed to launch Chrome subprocess: {e!r}")
+            if self.log:
+                self.log.error('attach_launch_failed', e)
             return False
 
         print(f"   Chrome launched (PID {self._chrome_subprocess.pid}, profile at {profile_dir}).")
+        if self.log:
+            self.log.event('attach_launch', {
+                'ok': True,
+                'chrome_bin': chrome_bin,
+                'pid': self._chrome_subprocess.pid,
+                'debug_port': self._chrome_debug_port,
+                'profile_dir': str(profile_dir),
+            })
         print()
         print("=" * 60)
         print("🔐 LOG IN MANUALLY IN THE CHROME WINDOW")
@@ -579,9 +757,19 @@ class IndeedDownloader:
         an authenticated Indeed session — caller should not save it and
         should not proceed into API calls."""
         if not cookies:
+            if self.log:
+                self.log.event('session_check', {'ok': False, 'reason': 'no cookies captured'})
             return False, "no cookies captured"
         names = {c.get('name') for c in cookies if isinstance(c, dict)}
         missing = [n for n in self._ESSENTIAL_SESSION_COOKIES if n not in names]
+        # Names-only logging — never log cookie values (auth tokens, PII).
+        if self.log:
+            self.log.event('session_check', {
+                'cookie_count': len(cookies),
+                'cookie_names_sample': sorted(names)[:30],
+                'missing_essentials': missing,
+                'ok': not missing and len(cookies) >= 5,
+            })
         if missing:
             return False, f"missing essential session cookies: {', '.join(missing)}"
         if len(cookies) < 5:
@@ -884,10 +1072,35 @@ class IndeedDownloader:
 
             if self.api_key:
                 print(f"   ✅ API Key captured")
+                if self.log:
+                    self.log.event('api_key_capture', {'ok': True})
             else:
                 print(f"   ⚠ API key NOT captured — performance log had no graphql request to apis.indeed.com (session likely unauthenticated)")
+                if self.log:
+                    # Also log a sample of URLs the performance log DID contain,
+                    # so we can tell "page never loaded" from "page loaded but
+                    # didn't hit apis.indeed.com" in post-mortem.
+                    try:
+                        sample_urls = []
+                        for log in (self.driver.get_log('performance') or [])[:200]:
+                            try:
+                                m = json.loads(log['message'])['message']
+                                if m.get('method') == 'Network.requestWillBeSent':
+                                    u = m['params']['request']['url']
+                                    sample_urls.append(u[:140])
+                            except (KeyError, json.JSONDecodeError):
+                                continue
+                        self.log.event('api_key_capture', {
+                            'ok': False,
+                            'url_sample': sample_urls[:20],
+                            'total_perf_entries': len(sample_urls),
+                        })
+                    except Exception:
+                        self.log.event('api_key_capture', {'ok': False})
         except Exception as e:
             print(f"   ⚠ API-key capture threw: {e!r}")
+            if self.log:
+                self.log.error('api_key_capture_exception', e)
 
     def _clean_job_title(self, title: str) -> str:
         """Clean the job title to produce a valid folder name"""
@@ -1115,9 +1328,19 @@ class IndeedDownloader:
                 return [], 0, False
             if 'errors' in result:
                 print(f"   ⚠ GraphQL errors from Indeed:")
+                msgs = []
                 for err in (result.get('errors') or [])[:3]:
                     msg = err.get('message', str(err)) if isinstance(err, dict) else str(err)
                     print(f"      • {msg}")
+                    msgs.append(msg)
+                if self.log:
+                    self.log.event('graphql_error', {
+                        'messages': msgs,
+                        'has_api_key': bool(self.api_key),
+                        'has_ctk': bool(self.ctk),
+                        'dispositions': dispositions,
+                        'offset': offset,
+                    })
                 return [], 0, False
 
             rcp = result.get('data', {}).get('findRCPMatches', {}) or {}
@@ -2883,7 +3106,11 @@ class IndeedDownloader:
             self.show_menu()
 
             if not self.setup_chrome():
+                if self.log:
+                    self.log.event('setup_chrome', {'ok': False})
                 return
+            if self.log:
+                self.log.event('setup_chrome', {'ok': True, 'has_api_key': bool(self.api_key), 'has_ctk': bool(self.ctk)})
 
             self.start_time = time.time()
 
@@ -2899,22 +3126,75 @@ class IndeedDownloader:
 
         except KeyboardInterrupt:
             print("\n\n⚠️ Interrupted by user")
+            if self.log:
+                self.log.info('interrupted_by_user')
             self.print_statistics()
 
         except Exception as e:
             print(f"\n❌ Error: {e}")
-            import traceback
             traceback.print_exc()
+            if self.log:
+                self.log.error('fatal_in_run', e)
 
         finally:
+            if self.log:
+                # Dump final stats for the bug-report bundle.
+                self.log.event('final_stats', dict(self.stats))
             if self.driver:
-                input("\nPress Enter to close Chrome...")
-                self.driver.quit()
+                # In attach mode don't kill the Chrome subprocess — the user
+                # may want to keep browsing. Just detach Selenium.
+                if self.browser_launch == 'attach':
+                    try:
+                        # quit() would tear down the browser; we only want
+                        # to release our session. Selenium doesn't expose a
+                        # "detach without quitting" method, but dropping the
+                        # reference keeps Chrome alive because we spawned it
+                        # as a detached subprocess above.
+                        self.driver = None
+                    except Exception:
+                        pass
+                    print("\n(Chrome window left open — close it yourself when you're done.)")
+                else:
+                    input("\nPress Enter to close Chrome...")
+                    self.driver.quit()
+
+
+def _install_crash_logger(logger: RunLogger):
+    """Catch anything that bypasses run()'s try/except (e.g., during import
+    or menu input) so the log captures the full traceback before the .exe
+    console closes."""
+    def _hook(exc_type, exc_value, exc_tb):
+        try:
+            logger.error('uncaught_exception', exc_value)
+        except Exception:
+            pass
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+    sys.excepthook = _hook
 
 
 def main():
-    downloader = IndeedDownloader()
-    downloader.run()
+    # Resolve log folder the same way IndeedDownloader does so we write to
+    # the same place. Default "logs" is relative to cwd, which for a .exe
+    # is typically the folder the user double-clicked.
+    log_folder = Path(os.getenv('LOG_FOLDER', 'logs'))
+    logger = RunLogger(log_folder)
+    _install_crash_logger(logger)
+
+    # Mirror every print() into the log file so the user's console output
+    # is preserved verbatim. Don't tee stderr — tqdm's progress bars would
+    # fill the log with carriage-return spam.
+    sys.stdout = _TeeStream(sys.stdout, logger.raw_file)
+
+    print(f"📝 Run log: {logger.path}")
+    print(f"   (if something breaks, send the file at: {logger.latest_path})")
+    print()
+
+    downloader = IndeedDownloader(log=logger)
+    try:
+        downloader.run()
+    finally:
+        logger.close()
+        print(f"\n📝 Log saved: {logger.latest_path}")
 
 
 if __name__ == "__main__":
