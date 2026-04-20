@@ -247,18 +247,59 @@ class IndeedDownloader:
         self.driver.maximize_window()
         self.wait = WebDriverWait(self.driver, 30)
 
+    # A real authenticated Indeed Employer session includes these cookies.
+    # If they're missing after login, Indeed didn't actually issue a session
+    # (usually because a VPN IP triggered Cloudflare, the login form errored
+    # silently, or the user's tracking-protection stripped them). The shell
+    # of the page may still render enough DOM for _is_logged_in() to pass,
+    # but every subsequent API call will fail.
+    _ESSENTIAL_SESSION_COOKIES = ('CTK', '__Secure-PassportAuthProxy-BearerToken')
+
+    def _session_is_healthy(self, cookies: list) -> tuple:
+        """Return (ok, reason). `ok=False` means the cookie set can't sustain
+        an authenticated Indeed session — caller should not save it and
+        should not proceed into API calls."""
+        if not cookies:
+            return False, "no cookies captured"
+        names = {c.get('name') for c in cookies if isinstance(c, dict)}
+        missing = [n for n in self._ESSENTIAL_SESSION_COOKIES if n not in names]
+        if missing:
+            return False, f"missing essential session cookies: {', '.join(missing)}"
+        if len(cookies) < 5:
+            return False, f"only {len(cookies)} cookies captured (expected 15+)"
+        return True, ""
+
+    def _print_vpn_remediation(self, reason: str) -> None:
+        """Shared error message for the VPN/Cloudflare-broken-session case."""
+        print(f"   ⚠ Session looks incomplete: {reason}")
+        print("   Indeed did not issue the auth cookies this login needs.")
+        print("   Most common cause is a VPN IP (NordVPN, etc.) hitting a")
+        print("   Cloudflare challenge that silently strips session cookies.")
+        print("   Try one of:")
+        print("     • Disable NordVPN (or any VPN) on this machine, then re-run.")
+        print("     • Clear Chrome's cookies for indeed.com and log in again.")
+        print("     • Switch to Frontend (Selenium) mode — option 2 at the menu.")
+
     def _load_saved_cookies(self) -> list:
-        """Load cookies from saved JSON file if it exists"""
+        """Load cookies from saved JSON file if it exists. Refuses files
+        that couldn't possibly represent a real session (too few cookies or
+        missing essentials) — those are stale artifacts of prior failed
+        runs and would confuse _is_logged_in() into a false positive."""
         cookies_file = Path(self.log_folder) / 'indeed_cookies.json'
-        if cookies_file.exists():
-            try:
-                with open(cookies_file, 'r', encoding='utf-8') as f:
-                    cookies = json.load(f)
-                if cookies and len(cookies) > 0:
-                    return cookies
-            except (json.JSONDecodeError, IOError):
-                pass
-        return []
+        if not cookies_file.exists():
+            return []
+        try:
+            with open(cookies_file, 'r', encoding='utf-8') as f:
+                cookies = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return []
+        if not cookies:
+            return []
+        ok, reason = self._session_is_healthy(cookies)
+        if not ok:
+            print(f"⚠️  Saved cookies rejected ({reason}) — treating as fresh login.")
+            return []
+        return cookies
 
     def _inject_cookies(self, cookies_list: list):
         """Inject cookies into the browser session"""
@@ -420,20 +461,34 @@ class IndeedDownloader:
         # Give the page time to fully load after login
         time.sleep(3)
 
-        # Capture and save cookies from the authenticated session
+        # Capture cookies from the authenticated session
         cookies = self._capture_browser_cookies()
-        if cookies:
-            self._save_cookies(cookies)
-        else:
-            print("   ⚠️  No Indeed cookies captured")
+
+        # Validate the session actually received the auth cookies that make
+        # Indeed's GraphQL requests authenticated. NordVPN + Cloudflare can
+        # produce a visibly logged-in page with no session cookies set,
+        # which would pass _is_logged_in() but fail every API call.
+        ok, reason = self._session_is_healthy(cookies)
+        if not ok:
+            self._print_vpn_remediation(reason)
+            # Deliberately do NOT save the partial cookie file — it would
+            # be loaded on the next run and short-circuit back to the same
+            # false-positive logged-in state.
+            return False
+
+        self._save_cookies(cookies)
 
         # Navigate to candidates page and capture API key
         self._capture_api_key()
 
         if not self.api_key:
-            print("❌ Authentication completed but API key could not be captured from network logs.")
-            print("   Indeed may have changed its frontend. Delete indeed_cookies.json and try again,")
-            print("   or switch to Frontend (Selenium) mode.")
+            print("❌ Authentication looked OK (cookies present) but no GraphQL API key")
+            print("   appeared in the Chrome performance log.")
+            print("   Indeed may be throttling this session or their frontend changed.")
+            print("   Try one of:")
+            print("     • Quit Chrome fully (all windows) and re-run.")
+            print("     • Disable any VPN/proxy and re-run.")
+            print("     • Switch to Frontend (Selenium) mode — option 2 at the menu.")
             return False
 
         print("✅ Authentication successful!")
