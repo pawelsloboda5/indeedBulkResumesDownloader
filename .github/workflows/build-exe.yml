@@ -20,7 +20,7 @@ jobs:
           pip install pyinstaller==6.3.0
 
       - name: Build
-        run: pyinstaller --onefile --name IndeedCVDownloader --noconfirm --collect-data selenium --collect-binaries selenium indeed_downloader.py
+        run: pyinstaller --onefile --name IndeedCVDownloader --noconfirm --collect-data selenium --collect-binaries selenium --collect-all undetected_chromedriver indeed_downloader.py
 
       - name: Hash the artifact (SHA-256)
         run: certutil -hashfile dist\IndeedCVDownloader.exe SHA256

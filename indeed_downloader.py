@@ -261,39 +261,91 @@ class IndeedDownloader:
     """
 
     def _init_chrome(self):
-        """Initialize Chrome browser with options"""
+        """Initialize Chrome browser with anti-detection patches.
+
+        First tries undetected-chromedriver (which patches the CDP-level
+        fingerprints we can't reach from user-space Python: TLS client hello
+        ordering, process-info leaks, chromedriver binary signature). Falls
+        back to stock Selenium with our best-effort stealth init-script if
+        UC isn't importable (e.g., a minimal build environment)."""
         print("🌐 Opening Chrome...")
 
-        chrome_options = Options()
-        chrome_options.add_argument('--disable-blink-features=AutomationControlled')
-        chrome_options.add_argument('--log-level=3')
-        chrome_options.add_argument('--silent')
-        # A real-user window size reads as less robotic than maximize_window()
-        # on a headless-style runner and avoids odd aspect ratios.
-        chrome_options.add_argument('--window-size=1920,1080')
-        # Pin the UA at the argument layer too, in case the CDP override
-        # below doesn't fire before the very first navigation.
-        chrome_options.add_argument(f'--user-agent={self._STEALTH_USER_AGENT}')
-        chrome_options.add_experimental_option('excludeSwitches', ['enable-automation', 'enable-logging'])
-        chrome_options.add_experimental_option('useAutomationExtension', False)
-        chrome_options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
+        self._using_uc = False
+        try:
+            import undetected_chromedriver as uc
+            # UC strips excludeSwitches / useAutomationExtension itself — in
+            # fact setting them is a tell, because real Chrome doesn't have
+            # those exclusions. So we deliberately don't pass them here.
+            uc_options = uc.ChromeOptions()
+            uc_options.add_argument('--log-level=3')
+            uc_options.add_argument('--silent')
+            uc_options.add_argument('--window-size=1920,1080')
+            uc_options.add_argument(f'--user-agent={self._STEALTH_USER_AGENT}')
+            prefs = {
+                "download.default_directory": str(Path(self.download_folder).absolute()),
+                "download.prompt_for_download": False,
+                "plugins.always_open_pdf_externally": True,
+                "credentials_enable_service": False,
+                "profile.password_manager_enabled": False,
+            }
+            uc_options.add_experimental_option("prefs", prefs)
+            # Perf log is still required by _capture_api_key.
+            uc_options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
 
-        prefs = {
-            "download.default_directory": str(Path(self.download_folder).absolute()),
-            "download.prompt_for_download": False,
-            "plugins.always_open_pdf_externally": True,
-            # Don't advertise "I'm being automated" in the prefs, either.
-            "credentials_enable_service": False,
-            "profile.password_manager_enabled": False,
-        }
-        chrome_options.add_experimental_option("prefs", prefs)
+            self.driver = uc.Chrome(options=uc_options, use_subprocess=True)
+            self._using_uc = True
+            print("   (stealth: undetected-chromedriver)")
+        except ImportError:
+            # Fallback: stock Selenium with our manual CDP stealth patches.
+            chrome_options = Options()
+            chrome_options.add_argument('--disable-blink-features=AutomationControlled')
+            chrome_options.add_argument('--log-level=3')
+            chrome_options.add_argument('--silent')
+            chrome_options.add_argument('--window-size=1920,1080')
+            chrome_options.add_argument(f'--user-agent={self._STEALTH_USER_AGENT}')
+            chrome_options.add_experimental_option('excludeSwitches', ['enable-automation', 'enable-logging'])
+            chrome_options.add_experimental_option('useAutomationExtension', False)
+            chrome_options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
+            prefs = {
+                "download.default_directory": str(Path(self.download_folder).absolute()),
+                "download.prompt_for_download": False,
+                "plugins.always_open_pdf_externally": True,
+                "credentials_enable_service": False,
+                "profile.password_manager_enabled": False,
+            }
+            chrome_options.add_experimental_option("prefs", prefs)
+            self.driver = webdriver.Chrome(options=chrome_options)
+            print("   (stealth: stock Selenium + CDP patches)")
+        except Exception as e:
+            # UC can fail to match a patched driver to the installed Chrome
+            # version, or hit a permissions issue writing its driver cache.
+            # Don't leave the user staring at a stacktrace — fall back to
+            # stock Selenium and keep going.
+            print(f"   ⚠ undetected-chromedriver failed ({e!r}); falling back to stock Selenium")
+            chrome_options = Options()
+            chrome_options.add_argument('--disable-blink-features=AutomationControlled')
+            chrome_options.add_argument('--log-level=3')
+            chrome_options.add_argument('--silent')
+            chrome_options.add_argument('--window-size=1920,1080')
+            chrome_options.add_argument(f'--user-agent={self._STEALTH_USER_AGENT}')
+            chrome_options.add_experimental_option('excludeSwitches', ['enable-automation', 'enable-logging'])
+            chrome_options.add_experimental_option('useAutomationExtension', False)
+            chrome_options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
+            prefs = {
+                "download.default_directory": str(Path(self.download_folder).absolute()),
+                "download.prompt_for_download": False,
+                "plugins.always_open_pdf_externally": True,
+                "credentials_enable_service": False,
+                "profile.password_manager_enabled": False,
+            }
+            chrome_options.add_experimental_option("prefs", prefs)
+            self.driver = webdriver.Chrome(options=chrome_options)
 
-        self.driver = webdriver.Chrome(options=chrome_options)
-
-        # Install the stealth patches BEFORE any navigation so they're in
-        # place when the login form first renders. addScriptToEvaluateOn
-        # NewDocument runs on every new document — including the initial
-        # "about:blank" — so nothing Indeed's JS can read is still truthy.
+        # Install the stealth init-script. UC applies most of this patching
+        # itself, but doubling up is harmless and covers the edge where UC
+        # missed a property. addScriptToEvaluateOnNewDocument runs on every
+        # new document before any page JS — so it's in place for the login
+        # form's first render.
         try:
             self.driver.execute_cdp_cmd(
                 'Page.addScriptToEvaluateOnNewDocument',
