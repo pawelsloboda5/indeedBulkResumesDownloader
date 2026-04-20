@@ -397,7 +397,19 @@ class IndeedDownloader:
             if self._is_logged_in():
                 print("✅ Logged in with saved cookies")
                 self._capture_api_key()
-                return True
+                if self.api_key:
+                    # Re-capture + re-save so short-lived tokens (bearer JWT,
+                    # __cf_bm) the browser just refreshed roll forward to the
+                    # next run. Without this the file on disk freezes at day-1
+                    # values and auth silently dies after the JWT's 1-hour TTL.
+                    fresh_cookies = self._capture_browser_cookies()
+                    if fresh_cookies:
+                        self._save_cookies(fresh_cookies)
+                    return True
+                # Hostname check passed but dashboard never issued a real
+                # GraphQL request — session is effectively dead. Fall through
+                # to manual re-login instead of proceeding with api_key=None.
+                print("⚠️  Logged-in shell detected but no GraphQL API key captured — session stale, asking for manual login")
             else:
                 print("⚠️  Cookies expired or invalid")
 
@@ -417,6 +429,12 @@ class IndeedDownloader:
 
         # Navigate to candidates page and capture API key
         self._capture_api_key()
+
+        if not self.api_key:
+            print("❌ Authentication completed but API key could not be captured from network logs.")
+            print("   Indeed may have changed its frontend. Delete indeed_cookies.json and try again,")
+            print("   or switch to Frontend (Selenium) mode.")
+            return False
 
         print("✅ Authentication successful!")
         return True
@@ -445,8 +463,10 @@ class IndeedDownloader:
 
             if self.api_key:
                 print(f"   ✅ API Key captured")
-        except Exception:
-            pass
+            else:
+                print(f"   ⚠ API key NOT captured — performance log had no graphql request to apis.indeed.com (session likely unauthenticated)")
+        except Exception as e:
+            print(f"   ⚠ API-key capture threw: {e!r}")
 
     def _clean_job_title(self, title: str) -> str:
         """Clean the job title to produce a valid folder name"""
@@ -641,6 +661,15 @@ class IndeedDownloader:
         if offset == 0:
             ids = variables["input"].get("identifiers", {})
             print(f"   🔎 Query: jobIdentifiers={ids or '{} (all jobs)'}, dispositions={len(dispositions)}, limit={limit}")
+
+        # Abort early on missing auth instead of sending the literal string
+        # "None" as the indeed-api-key header (Python f-string would stringify
+        # None). That produced Indeed's "An API Key is required" error which
+        # HR was hitting after saved cookies went stale.
+        if not self.api_key or not self.ctk:
+            print("❌ Aborting: missing indeed-api-key or CTK (auth did not complete).")
+            print("   Delete logs/indeed_cookies.json and re-run to log in fresh.")
+            return [], 0, False
 
         js_code = f"""
         return await fetch("https://apis.indeed.com/graphql?co=US&locale=en-US", {{
