@@ -12,7 +12,7 @@ import re
 import base64
 import shutil
 import subprocess
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, parse_qs, unquote, quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime
@@ -1749,6 +1749,9 @@ class IndeedDownloader:
             print("   All CVs are already downloaded!")
             # Save stats: announced, recovered, processed
             self._save_job_stats(total_expected, total_recovered, already_processed + len(candidates_no_cv))
+            # Global counter parity with the Frontend path so the end-of-run
+            # summary reflects work actually seen by this job.
+            self.stats['total_processed'] += already_processed + len(candidates_no_cv)
             # Track job stats for report
             self.job_stats.append({
                 'job_name': self.current_job_name,
@@ -1762,11 +1765,19 @@ class IndeedDownloader:
 
         print(f"\n   Downloading...\n")
 
+        # Candidates we're skipping (CV already on disk + people who applied
+        # without a CV) count as "processed" in the global summary too.
+        self.stats['total_processed'] += already_processed + len(candidates_no_cv)
+
         downloaded_count = 0
         with tqdm(total=len(candidates_with_cv), desc="   CVs") as pbar:
             for candidate in candidates_with_cv:
                 if self.download_cv_api(candidate):
                     downloaded_count += 1
+                # Global counter parity with the Frontend path; without this
+                # the end-of-run STATISTICS block printed "Total processed: 0"
+                # even when Downloaded was e.g. 329.
+                self.stats['total_processed'] += 1
                 pbar.update(1)
 
         # Save stats: announced, recovered, processed
@@ -1809,23 +1820,95 @@ class IndeedDownloader:
     # actually hit during the first candidate so a future build can upgrade
     # this to pure-API.
 
+    # Fallback chain for locating the candidate-list sidebar. Tried in order
+    # until one reports ≥1 item. The previous single-selector impl failed on
+    # HR's machine (see logs/run_20260420_143601.log: abort "Could not click
+    # the first candidate") because the list DOM wasn't hydrated when a
+    # fixed 3-second sleep elapsed. A polling wait across multiple selectors
+    # absorbs both timing and DOM-variation differences.
+    _CANDIDATE_LIST_SELECTORS = (
+        '#hanselCandidateListContainer li[data-testid="CandidateListItem"]',
+        '[data-testid="candidate-list"] li[data-testid="CandidateListItem"]',
+        '[data-testid="candidates-pipeline"] li[data-testid="CandidateListItem"]',
+        'ul[role="list"] li[data-testid="CandidateListItem"]',
+        'li[data-testid="CandidateListItem"]',
+    )
+
     def _click_first_candidate_in_list(self) -> bool:
         """Click the first row in the candidate-list sidebar so subsequent
-        _go_to_next_candidate() calls have a current row to advance from."""
+        _go_to_next_candidate() calls have a current row to advance from.
+
+        Polls multiple candidate-list selectors for up to 8s — enough to
+        survive the list-hydration race on slower machines / first-render
+        after navigation."""
+        deadline = time.time() + 8.0
+        while time.time() < deadline:
+            for sel in self._CANDIDATE_LIST_SELECTORS:
+                try:
+                    count = self.driver.execute_script(
+                        "return document.querySelectorAll(arguments[0]).length;",
+                        sel,
+                    )
+                except Exception:
+                    continue
+                if not count:
+                    continue
+                try:
+                    clicked = self.driver.execute_script(
+                        """
+                        const items = document.querySelectorAll(arguments[0]);
+                        if (!items.length) return false;
+                        const btn = items[0].querySelector('button[data-testid="CandidateListItem-button"]')
+                                    || items[0].querySelector('button')
+                                    || items[0].querySelector('a');
+                        if (!btn) return false;
+                        items[0].scrollIntoView({block: 'center'});
+                        btn.click();
+                        return true;
+                        """,
+                        sel,
+                    )
+                except Exception:
+                    continue
+                if clicked:
+                    return True
+            time.sleep(0.5)
+        return False
+
+    def _log_app_data_pass_abort(self, reason: str) -> None:
+        """Best-effort diagnostic dump when the app-data pass can't start.
+        Writes a structured event to the run log with URL, page title, and
+        DOM counts so the next regression triages from latest.log alone."""
+        if not self.log:
+            return
         try:
-            return bool(self.driver.execute_script("""
-                const items = document.querySelectorAll(
-                    '#hanselCandidateListContainer > div > ul > li[data-testid="CandidateListItem"]'
-                );
-                if (!items.length) return false;
-                const btn = items[0].querySelector('button[data-testid="CandidateListItem-button"]');
-                if (!btn) return false;
-                items[0].scrollIntoView({block: 'center'});
-                btn.click();
-                return true;
-            """))
+            title = self.driver.title
         except Exception:
-            return False
+            title = '<title unavailable>'
+        try:
+            url = self.driver.current_url
+        except Exception:
+            url = '<url unavailable>'
+        try:
+            counts = self.driver.execute_script(
+                """
+                return {
+                    hansel: document.querySelectorAll('#hanselCandidateListContainer li').length,
+                    testid: document.querySelectorAll('li[data-testid="CandidateListItem"]').length,
+                    any_li: document.querySelectorAll('ul li').length,
+                    aria_current: document.querySelectorAll('[aria-current="true"]').length,
+                };
+                """
+            )
+        except Exception:
+            counts = None
+        self.log.event('app_data_pass_abort', {
+            'reason': reason,
+            'url': url,
+            'page_title': title,
+            'list_counts': counts,
+            'download_app_data': self.download_app_data,
+        })
 
     def _maybe_capture_app_data_urls(self) -> None:
         """Best-effort: scrape Chrome's performance log for XHR URLs that
@@ -1899,32 +1982,48 @@ class IndeedDownloader:
 
         print("\n📎 App-data pass (HTML + JSON per candidate via the browser)...")
 
-        # Ensure we're on the candidate list for this job. Backend CV
-        # download leaves the browser on the list page, but re-navigating
-        # to the job's own URL (when we have one) guarantees we start from
-        # candidate #1 rather than whichever one HR had selected manually.
-        target_url = None
-        if self.current_job_id:
-            target_url = f"https://employers.indeed.com/candidates?selectedJobs={self.current_job_id}"
+        # Navigation guard. Previous revision did a raw substring check on
+        # `self.current_job_id in current_url`, which failed for HR because
+        # her URL had the job IRI percent-encoded ("%3D%3D" tail) while
+        # self.current_job_id is the decoded form ("=="). That triggered an
+        # unnecessary re-navigation that (a) stripped her `id=<candidate>`
+        # param so no row was selected on arrival, and (b) only gave the
+        # list 3 seconds to hydrate — the pass aborted before the DOM was
+        # ready. Compare both forms so we stay put when we're already there.
         current = self.driver.current_url or ''
-        if target_url and (self.current_job_id not in current or 'candidates' not in current):
+        already_on_job = False
+        if self.current_job_id:
+            encoded_id = quote(self.current_job_id, safe='')
+            decoded_url = unquote(current)
+            already_on_job = (
+                self.current_job_id in decoded_url
+                or encoded_id in current
+            )
+
+        if not already_on_job and self.current_job_id:
             try:
+                target_url = f"https://employers.indeed.com/candidates?selectedJobs={quote(self.current_job_id, safe='')}"
                 self.driver.get(target_url)
-                time.sleep(3)
             except Exception:
                 pass
-        elif 'candidates' not in current:
+        elif not already_on_job and 'candidates' not in current:
             try:
                 self.driver.get('https://employers.indeed.com/candidates')
-                time.sleep(3)
             except Exception:
                 pass
 
-        if not self._click_first_candidate_in_list():
-            print("   ⚠ Could not click the first candidate — skipping app-data pass.")
-            return
-
-        time.sleep(self.next_candidate_delay)
+        # If a candidate is already open in the detail pane (HR's URL had
+        # `id=<candidate>`, or the previous job in an All-Jobs run left one
+        # selected), use it directly. _click_first_candidate_in_list() stays
+        # as a fallback when no row is selected.
+        start_name = self._get_current_candidate_name()
+        if not start_name:
+            if not self._click_first_candidate_in_list():
+                self._log_app_data_pass_abort('no_first_candidate')
+                print("   ⚠ Could not locate the candidate list — skipping app-data pass.")
+                print("     (Details written to logs/latest.log for diagnosis.)")
+                return
+            time.sleep(self.next_candidate_delay)
 
         pbar = tqdm(desc="   App data")
         discovered = False
