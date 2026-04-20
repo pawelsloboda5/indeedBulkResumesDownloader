@@ -223,6 +223,43 @@ class IndeedDownloader:
         print("=" * 60)
         print()
 
+    # Pretend to be a stock Chrome on Windows 10. Matches what a real user's
+    # browser sends and avoids the "HeadlessChrome"/automation-specific UA
+    # strings Indeed's bot-guard uses as a quick-reject signal.
+    _STEALTH_USER_AGENT = (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) '
+        'Chrome/130.0.0.0 Safari/537.36'
+    )
+
+    # This script runs on EVERY new document (before any page JS), patching
+    # the handful of properties Indeed's anti-automation reads: webdriver
+    # flag, empty plugins array, missing window.chrome, etc. The one-shot
+    # execute_script we used to do is too late — Indeed checks these on
+    # the login form's first render.
+    _STEALTH_INIT_SCRIPT = r"""
+        // navigator.webdriver — the #1 Selenium tell.
+        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+        // Plugins array: real Chrome has several built-in plugins; an empty
+        // list is a common automated-browser signature.
+        Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+        // Languages: Selenium sometimes ships an empty or single-entry list.
+        Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
+        // window.chrome — real Chrome always has a runtime object on it.
+        window.chrome = window.chrome || {};
+        window.chrome.runtime = window.chrome.runtime || {};
+        // navigator.permissions.query: headless Chrome returns 'denied' for
+        // notifications while "real" Chrome returns 'prompt' — some bot
+        // checks pick up on that.
+        const origQuery = (navigator.permissions && navigator.permissions.query) || null;
+        if (navigator.permissions) {
+            navigator.permissions.query = (p) =>
+                (p && p.name === 'notifications')
+                    ? Promise.resolve({ state: Notification.permission })
+                    : (origQuery ? origQuery(p) : Promise.resolve({ state: 'granted' }));
+        }
+    """
+
     def _init_chrome(self):
         """Initialize Chrome browser with options"""
         print("🌐 Opening Chrome...")
@@ -231,6 +268,12 @@ class IndeedDownloader:
         chrome_options.add_argument('--disable-blink-features=AutomationControlled')
         chrome_options.add_argument('--log-level=3')
         chrome_options.add_argument('--silent')
+        # A real-user window size reads as less robotic than maximize_window()
+        # on a headless-style runner and avoids odd aspect ratios.
+        chrome_options.add_argument('--window-size=1920,1080')
+        # Pin the UA at the argument layer too, in case the CDP override
+        # below doesn't fire before the very first navigation.
+        chrome_options.add_argument(f'--user-agent={self._STEALTH_USER_AGENT}')
         chrome_options.add_experimental_option('excludeSwitches', ['enable-automation', 'enable-logging'])
         chrome_options.add_experimental_option('useAutomationExtension', False)
         chrome_options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
@@ -238,13 +281,45 @@ class IndeedDownloader:
         prefs = {
             "download.default_directory": str(Path(self.download_folder).absolute()),
             "download.prompt_for_download": False,
-            "plugins.always_open_pdf_externally": True
+            "plugins.always_open_pdf_externally": True,
+            # Don't advertise "I'm being automated" in the prefs, either.
+            "credentials_enable_service": False,
+            "profile.password_manager_enabled": False,
         }
         chrome_options.add_experimental_option("prefs", prefs)
 
         self.driver = webdriver.Chrome(options=chrome_options)
-        self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-        self.driver.maximize_window()
+
+        # Install the stealth patches BEFORE any navigation so they're in
+        # place when the login form first renders. addScriptToEvaluateOn
+        # NewDocument runs on every new document — including the initial
+        # "about:blank" — so nothing Indeed's JS can read is still truthy.
+        try:
+            self.driver.execute_cdp_cmd(
+                'Page.addScriptToEvaluateOnNewDocument',
+                {'source': self._STEALTH_INIT_SCRIPT},
+            )
+        except Exception as e:
+            print(f"   ⚠ Stealth init (new-document) failed: {e!r}")
+        try:
+            self.driver.execute_cdp_cmd(
+                'Network.setUserAgentOverride',
+                {
+                    'userAgent': self._STEALTH_USER_AGENT,
+                    'acceptLanguage': 'en-US,en;q=0.9',
+                    'platform': 'Windows',
+                },
+            )
+        except Exception as e:
+            print(f"   ⚠ UA override failed: {e!r}")
+
+        # Fallback patch on the current document (about:blank) in case the
+        # CDP command above didn't register in time.
+        try:
+            self.driver.execute_script(self._STEALTH_INIT_SCRIPT)
+        except Exception:
+            pass
+
         self.wait = WebDriverWait(self.driver, 30)
 
     # A real authenticated Indeed Employer session includes these cookies.
