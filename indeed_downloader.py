@@ -10,6 +10,8 @@ import json
 import time
 import re
 import base64
+import shutil
+import subprocess
 from urllib.parse import urlparse, parse_qs, unquote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -77,6 +79,14 @@ class IndeedDownloader:
         self.job_mode = None  # 'single' or 'all'
         self.job_statuses = []  # ['ACTIVE', 'PAUSED', 'CLOSED']
         self.download_app_data = True  # Download screener-question HTML + raw JSON alongside CV
+        # 'auto' = tool launches + drives Chrome via Selenium (faster for users
+        # whose environment doesn't trigger Indeed's Cloudflare Turnstile block).
+        # 'attach' = tool launches Chrome as a bare subprocess with a debug port,
+        # user logs in manually (Turnstile sees a real human), then Selenium
+        # attaches to drive downloads. Slower UX but survives bot-detection.
+        self.browser_launch = 'auto'
+        self._chrome_debug_port = 9222
+        self._chrome_subprocess = None  # Popen handle for attach mode
 
     def _load_checkpoint(self) -> dict:
         """Load checkpoint data.
@@ -214,12 +224,32 @@ class IndeedDownloader:
                 print("❌ Invalid choice")
 
         print()
+        print("🖥  BROWSER LAUNCH:")
+        print("   1. Auto — the tool opens & drives Chrome for you (default)")
+        print("   2. Attach — the tool opens Chrome, YOU log in manually,")
+        print("      then the tool takes over. Use this if option 1 gave you")
+        print("      an \"unexpected error\" on the Indeed login screen.")
+        print()
+
+        while True:
+            choice = input("Choice (1/2): ").strip()
+            if choice == '1':
+                self.browser_launch = 'auto'
+                break
+            elif choice == '2':
+                self.browser_launch = 'attach'
+                break
+            else:
+                print("❌ Invalid choice")
+
+        print()
         print("=" * 60)
         print(f"✅ Mode: {self.mode.upper()}")
         print(f"✅ Jobs: {'Single' if self.job_mode == 'single' else 'All'}")
         if self.job_mode == 'all':
             print(f"✅ Statuses: {', '.join(self.job_statuses)}")
         print(f"✅ App data: {'Yes' if self.download_app_data else 'No'}")
+        print(f"✅ Browser:  {'Auto (Selenium-launched)' if self.browser_launch == 'auto' else 'Attach (manual login, bypasses bot-detection)'}")
         print("=" * 60)
         print()
 
@@ -373,6 +403,168 @@ class IndeedDownloader:
             pass
 
         self.wait = WebDriverWait(self.driver, 30)
+
+    # ==================== ATTACH MODE ====================
+    #
+    # Attach mode bypasses Indeed's Cloudflare Turnstile challenge. Turnstile
+    # runs invisibly on the login form and, if it decides the client is a bot,
+    # silently refuses to populate the `cf-turnstile-response` field — Indeed
+    # then returns 403 on /account/emailvalidation. Even undetected-chromedriver
+    # can't always pass Turnstile because Turnstile fingerprints at the TLS
+    # layer (JA3/JA4) and looks for warm profile history.
+    #
+    # Attach mode sidesteps all of that:
+    #   1. Launch Chrome as a plain subprocess — NO Selenium/CDP at launch
+    #      time, so Chrome is indistinguishable from a user-started browser
+    #      from Turnstile's point of view.
+    #   2. User logs in manually. Turnstile sees real human interaction and
+    #      issues its token. Indeed accepts the login, sets session cookies.
+    #   3. THEN we attach Selenium via the --remote-debugging-port the
+    #      subprocess is listening on. Indeed's API doesn't re-challenge on
+    #      subsequent calls — it just checks the session cookies.
+    #
+    # The user-data-dir is persistent under logs/chrome_profile/ so repeat
+    # runs don't require re-login until Indeed's own session expiry.
+
+    # Chrome binary lookup order. First hit wins. The "shutil.which" fallbacks
+    # at the call site cover cases where Chrome is on PATH but not at a
+    # standard install location (e.g., portable installs, work-provisioned
+    # laptops that move it).
+    _CHROME_CANDIDATE_PATHS = (
+        # Windows
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        # macOS
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        # Linux
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+    )
+
+    def _find_chrome_binary(self) -> Optional[str]:
+        """Locate a real Chrome binary for attach-mode subprocess launch.
+        Probes Windows/mac/Linux standard install paths plus %LOCALAPPDATA%
+        and PATH, returning the first one that exists."""
+        # %LOCALAPPDATA% on Windows — per-user installs land here.
+        localappdata = os.environ.get('LOCALAPPDATA')
+        if localappdata:
+            user_chrome = Path(localappdata) / 'Google' / 'Chrome' / 'Application' / 'chrome.exe'
+            if user_chrome.exists():
+                return str(user_chrome)
+
+        for p in self._CHROME_CANDIDATE_PATHS:
+            if Path(p).exists():
+                return p
+
+        for name in ('chrome', 'google-chrome', 'chromium', 'chrome.exe'):
+            found = shutil.which(name)
+            if found:
+                return found
+
+        return None
+
+    def _init_chrome_attached(self) -> bool:
+        """Launch Chrome as a detached subprocess with a debug port, wait
+        for the user to log in, then attach Selenium. Returns True on
+        success, False on unrecoverable error (user aborts, Chrome not
+        found, etc.)."""
+        print("🌐 Opening Chrome in attach mode...")
+
+        chrome_bin = self._find_chrome_binary()
+        if not chrome_bin:
+            print("❌ Could not find Chrome on this machine automatically.")
+            print("   Common paths checked: Program Files, Program Files (x86),")
+            print("   %LOCALAPPDATA%\\Google\\Chrome, and PATH.")
+            entered = input("   Paste the full path to chrome.exe (or blank to abort): ").strip().strip('"')
+            if not entered or not Path(entered).exists():
+                print("❌ No Chrome binary — aborting.")
+                return False
+            chrome_bin = entered
+
+        profile_dir = Path(self.log_folder).absolute() / "chrome_profile"
+        profile_dir.mkdir(parents=True, exist_ok=True)
+
+        # Redirect Chrome's own stderr to a file so it doesn't pollute our
+        # console. If launch fails, the log lives next to the profile for
+        # postmortem — otherwise it's benign telemetry noise.
+        chrome_log_path = profile_dir / "chrome_stderr.log"
+
+        cmd = [
+            str(chrome_bin),
+            f"--remote-debugging-port={self._chrome_debug_port}",
+            f"--user-data-dir={profile_dir}",
+            # These make the first-run experience cleaner for HR:
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-features=Translate",
+            "https://employers.indeed.com",
+        ]
+
+        try:
+            # close_fds on POSIX, no-op on Windows; keep the subprocess
+            # detached from our console so closing it doesn't kill the .exe.
+            chrome_log = open(chrome_log_path, 'ab')
+            kwargs = {
+                'stdout': subprocess.DEVNULL,
+                'stderr': chrome_log,
+                'close_fds': True,
+            }
+            if os.name == 'nt':
+                # Windows: detach the Chrome process so it survives our exit.
+                kwargs['creationflags'] = (
+                    getattr(subprocess, 'DETACHED_PROCESS', 0x00000008)
+                    | getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0x00000200)
+                )
+            self._chrome_subprocess = subprocess.Popen(cmd, **kwargs)
+        except FileNotFoundError:
+            print(f"❌ Could not execute {chrome_bin} — file not found or not executable.")
+            return False
+        except Exception as e:
+            print(f"❌ Failed to launch Chrome subprocess: {e!r}")
+            return False
+
+        print(f"   Chrome launched (PID {self._chrome_subprocess.pid}, profile at {profile_dir}).")
+        print()
+        print("=" * 60)
+        print("🔐 LOG IN MANUALLY IN THE CHROME WINDOW")
+        print("=" * 60)
+        print("   1. In the Chrome window that just opened, sign in to")
+        print("      https://employers.indeed.com as you normally would.")
+        print("   2. When you see your employer dashboard with your jobs")
+        print("      listed, come back to this console.")
+        print("   3. Press Enter here to continue.")
+        print()
+        print("   (If it's your first time using attach mode you'll log in.")
+        print("    On future runs the profile persists — you'll already be")
+        print("    logged in and can press Enter right away.)")
+        print()
+        input("Press Enter when you're on the employer dashboard...")
+
+        # Give Chrome a moment to flush the session cookies to disk before
+        # we attach. Without a short wait, get_cookies() sometimes races.
+        time.sleep(2)
+
+        # Attach Selenium to the running Chrome. The debuggerAddress tells
+        # chromedriver to connect to the existing DevTools rather than
+        # spawn its own Chrome.
+        attach_opts = Options()
+        attach_opts.add_experimental_option(
+            "debuggerAddress", f"127.0.0.1:{self._chrome_debug_port}"
+        )
+        attach_opts.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
+
+        try:
+            self.driver = webdriver.Chrome(options=attach_opts)
+        except Exception as e:
+            print(f"❌ Couldn't attach Selenium to Chrome on port {self._chrome_debug_port}: {e!r}")
+            print(f"   Check {chrome_log_path} for Chrome-side errors.")
+            return False
+
+        self.wait = WebDriverWait(self.driver, 30)
+        print(f"✅ Attached to Chrome at 127.0.0.1:{self._chrome_debug_port}")
+        return True
 
     # A real authenticated Indeed Employer session includes these cookies.
     # If they're missing after login, Indeed didn't actually issue a session
@@ -549,6 +741,53 @@ class IndeedDownloader:
 
     def setup_chrome(self) -> bool:
         """Setup Chrome and authenticate - uses saved cookies or interactive login"""
+        # Attach mode is a completely different bootstrap: Chrome is launched
+        # as a bare subprocess, the user logs in by hand, then we attach. The
+        # subprocess Chrome carries its own persistent profile under
+        # logs/chrome_profile/, so we skip cookie load/save entirely.
+        if self.browser_launch == 'attach':
+            if not self._init_chrome_attached():
+                return False
+
+            # Ensure we're on /candidates so _capture_api_key has a real
+            # GraphQL request in the network log.
+            try:
+                self.driver.get("https://employers.indeed.com/candidates")
+                time.sleep(4)
+            except Exception:
+                pass
+
+            if not self._is_logged_in():
+                print("❌ Attached Chrome isn't on the employer dashboard.")
+                print("   Make sure you logged in in the Chrome window BEFORE pressing Enter,")
+                print("   then re-run the tool.")
+                return False
+
+            # Pull CTK from the attached browser's cookie jar. (We intentionally
+            # do NOT write indeed_cookies.json in attach mode — the subprocess
+            # Chrome's persistent profile is the source of truth for that
+            # session, and duplicating it on disk would just invite drift.)
+            try:
+                for cookie in (self.driver.get_cookies() or []):
+                    if cookie.get('name') == 'CTK':
+                        self.ctk = cookie.get('value')
+                    self.cookies[cookie.get('name')] = cookie.get('value')
+            except Exception:
+                pass
+
+            self._capture_api_key()
+
+            if not self.api_key:
+                print("❌ Attached OK but couldn't capture the GraphQL API key.")
+                print("   In the Chrome window, refresh the candidates page and try again.")
+                return False
+            if not self.ctk:
+                print("⚠  CTK cookie missing from attached session — partial login?")
+                return False
+
+            print("✅ Attached session authenticated.")
+            return True
+
         self._init_chrome()
 
         # Try to load saved cookies first
