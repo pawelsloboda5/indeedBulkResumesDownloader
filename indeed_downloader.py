@@ -35,7 +35,7 @@ load_dotenv('.env.config')
 
 # Bumped whenever the binary layout changes. Shown in log headers so bug
 # reports are pinned to a known build.
-TOOL_VERSION = "2026-04-20-attach-mode-logging"
+TOOL_VERSION = "2026-04-20-app-data-via-profile-urls"
 
 
 class RunLogger:
@@ -1761,6 +1761,10 @@ class IndeedDownloader:
                 'total_announced': total_expected,
                 'total_recovered': total_recovered
             })
+            # Still run the app-data pass — `downloaded_application_data`
+            # is dedup'd independently of the CV list, so HR can backfill
+            # screener Q&A for candidates whose resumes were already on disk.
+            self._run_app_data_pass_backend(all_candidates_list)
             return
 
         print(f"\n   Downloading...\n")
@@ -1796,7 +1800,10 @@ class IndeedDownloader:
 
         # Second pass: app-data per candidate, driving the UI (see
         # _run_app_data_pass_backend). No-op when download_app_data is False.
-        self._run_app_data_pass_backend()
+        # Pass the full candidate list so the pass can navigate directly to
+        # each profile by legacy_id — independent of the candidate-list
+        # sidebar DOM, which Indeed periodically restructures.
+        self._run_app_data_pass_backend(all_candidates_list)
 
     # ==================== APP DATA (BACKEND HYBRID) ====================
     #
@@ -1970,98 +1977,120 @@ class IndeedDownloader:
         except Exception:
             pass
 
-    def _run_app_data_pass_backend(self) -> None:
+    def _run_app_data_pass_backend(self, candidates_list: Optional[list] = None) -> None:
         """Run the UI-driven app-data download flow over every candidate
-        for the currently active job. Called after Backend-mode CV download
-        so CVs land fast via API, then app-data is collected sequentially."""
+        for the currently active job, driven by direct URL navigation
+        rather than candidate-list sidebar pagination.
+
+        Why not use the list sidebar? Indeed quietly shipped a new candidate
+        list DOM (see logs/run_20260420_155009.log: "any_li":225 on page but
+        "testid":0 and "hansel":0). Every list selector we had assumed the
+        container was `#hanselCandidateListContainer` with
+        `data-testid="CandidateListItem"` rows — those attributes are gone
+        on the new UI variant, so every list-sidebar-based approach fails
+        regardless of how many fallback selectors we stack.
+
+        Direct URL navigation bypasses the list entirely: we already have
+        every candidate's `legacy_id` from the GraphQL response, and
+        Indeed's profile URL takes that id as a query param
+        (`?id=<legacy_id>&selectedJobs=<iri>`). On each iteration we
+        navigate there, wait for the "..." kebab to appear, and then run
+        the existing `_download_application_data_frontend` helper which
+        uses text- and aria-label-based selectors that survive DOM renames.
+        """
         if not self.download_app_data:
             return
         if not self.current_job_folder:
             print("   ⚠ Skipping app-data pass: no job folder set.")
             return
+        if not candidates_list:
+            print("   ⚠ Skipping app-data pass: no candidate list provided.")
+            if self.log:
+                self.log.event('app_data_pass_abort', {'reason': 'no_candidates_list'})
+            return
 
-        print("\n📎 App-data pass (HTML + JSON per candidate via the browser)...")
+        job_iri_encoded = quote(self.current_job_id, safe='') if self.current_job_id else ''
 
-        # Navigation guard. Previous revision did a raw substring check on
-        # `self.current_job_id in current_url`, which failed for HR because
-        # her URL had the job IRI percent-encoded ("%3D%3D" tail) while
-        # self.current_job_id is the decoded form ("=="). That triggered an
-        # unnecessary re-navigation that (a) stripped her `id=<candidate>`
-        # param so no row was selected on arrival, and (b) only gave the
-        # list 3 seconds to hydrate — the pass aborted before the DOM was
-        # ready. Compare both forms so we stay put when we're already there.
-        current = self.driver.current_url or ''
-        already_on_job = False
-        if self.current_job_id:
-            encoded_id = quote(self.current_job_id, safe='')
-            decoded_url = unquote(current)
-            already_on_job = (
-                self.current_job_id in decoded_url
-                or encoded_id in current
-            )
+        print(f"\n📎 App-data pass — visiting each of {len(candidates_list)} candidate profiles directly...")
 
-        if not already_on_job and self.current_job_id:
-            try:
-                target_url = f"https://employers.indeed.com/candidates?selectedJobs={quote(self.current_job_id, safe='')}"
-                self.driver.get(target_url)
-            except Exception:
-                pass
-        elif not already_on_job and 'candidates' not in current:
-            try:
-                self.driver.get('https://employers.indeed.com/candidates')
-            except Exception:
-                pass
-
-        # If a candidate is already open in the detail pane (HR's URL had
-        # `id=<candidate>`, or the previous job in an All-Jobs run left one
-        # selected), use it directly. _click_first_candidate_in_list() stays
-        # as a fallback when no row is selected.
-        start_name = self._get_current_candidate_name()
-        if not start_name:
-            if not self._click_first_candidate_in_list():
-                self._log_app_data_pass_abort('no_first_candidate')
-                print("   ⚠ Could not locate the candidate list — skipping app-data pass.")
-                print("     (Details written to logs/latest.log for diagnosis.)")
-                return
-            time.sleep(self.next_candidate_delay)
-
-        pbar = tqdm(desc="   App data")
         discovered = False
-        # Outcome counters for the end-of-pass summary event. Without these
-        # a systemic per-candidate click failure (e.g., Indeed renames the
-        # kebab button) would show up only as "app_data_downloaded: 0" in
-        # final stats — no reason in the log.
         processed = 0
         succeeded = 0
         failed = 0
         skipped_already_done = 0
+        first_failure_logged = False
+
+        pbar = tqdm(total=len(candidates_list), desc="   App data")
         try:
-            while True:
-                name = self._get_current_candidate_name()
-                if not name:
-                    break
-                candidate_folder = self._create_candidate_folder(name)
-                already_done = name in self.checkpoint_data.get('downloaded_application_data', [])
-                if already_done:
+            for candidate in candidates_list:
+                name = candidate.get('name') or 'Unknown'
+                legacy_id = candidate.get('legacy_id')
+
+                if not legacy_id:
+                    # Should be rare — the GraphQL extractor normally drops
+                    # candidates without a legacyID. If one slips through,
+                    # we can't navigate to their profile by URL.
+                    failed += 1
+                    if self.log and not first_failure_logged:
+                        self.log.event('app_data_pass_abort',
+                                       {'reason': 'no_legacy_id', 'name_hash': hash(name)})
+                        first_failure_logged = True
+                    pbar.update(1)
+                    continue
+
+                if name in self.checkpoint_data.get('downloaded_application_data', []):
                     skipped_already_done += 1
+                    pbar.update(1)
+                    continue
+
+                candidate_folder = self._create_candidate_folder(name)
+
+                # Navigate to this candidate's profile. Passing selectedJobs
+                # alongside id keeps the job context so the kebab menu shows
+                # the right set of actions.
+                if job_iri_encoded:
+                    profile_url = (
+                        f"https://employers.indeed.com/candidates"
+                        f"?id={legacy_id}&selectedJobs={job_iri_encoded}"
+                    )
                 else:
-                    if self._download_application_data_frontend(name, candidate_folder):
-                        self._save_checkpoint(name=name, app_data=True)
-                        self.stats['app_data_downloaded'] += 1
-                        succeeded += 1
-                        if not discovered:
-                            self._maybe_capture_app_data_urls()
-                            discovered = True
-                    else:
-                        failed += 1
-                        # Dump DOM state on the FIRST failure only — enough
-                        # for triage, doesn't spam the log on repeat fails.
-                        if self.log and failed == 1:
-                            self._log_app_data_pass_abort('first_candidate_helper_returned_false')
+                    profile_url = f"https://employers.indeed.com/candidates?id={legacy_id}"
+
+                try:
+                    self.driver.get(profile_url)
+                except Exception:
+                    failed += 1
+                    pbar.update(1)
+                    continue
+
+                # Wait for the profile to render — the "..." kebab being
+                # present is our proof of life. _find_element_by_selectors
+                # uses WebDriverWait so this returns as soon as the kebab
+                # exists (or after the timeout).
+                kebab = self._find_element_by_selectors(self._KEBAB_MENU_SELECTORS, timeout_per=2.0)
+                if not kebab:
+                    failed += 1
+                    if self.log and not first_failure_logged:
+                        self._log_app_data_pass_abort('kebab_not_found_after_nav')
+                        first_failure_logged = True
+                    pbar.update(1)
+                    continue
+
+                if self._download_application_data_frontend(name, candidate_folder):
+                    self._save_checkpoint(name=name, app_data=True)
+                    self.stats['app_data_downloaded'] += 1
+                    succeeded += 1
+                    if not discovered:
+                        self._maybe_capture_app_data_urls()
+                        discovered = True
+                else:
+                    failed += 1
+                    if self.log and not first_failure_logged:
+                        self._log_app_data_pass_abort('helper_returned_false_on_profile')
+                        first_failure_logged = True
+
                 processed += 1
                 pbar.update(1)
-                if not self._go_to_next_candidate():
-                    break
                 time.sleep(self.next_candidate_delay)
         finally:
             pbar.close()
