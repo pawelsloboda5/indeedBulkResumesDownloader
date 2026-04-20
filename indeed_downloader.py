@@ -1139,6 +1139,172 @@ class IndeedDownloader:
             'total_recovered': total_recovered
         })
 
+        # Second pass: app-data per candidate, driving the UI (see
+        # _run_app_data_pass_backend). No-op when download_app_data is False.
+        self._run_app_data_pass_backend()
+
+    # ==================== APP DATA (BACKEND HYBRID) ====================
+    #
+    # Pure-API app-data download would require knowing the endpoints Indeed
+    # hits when the user clicks "Download files" in the application-data
+    # modal. FindRCPMatches doesn't return them, and we don't yet have a
+    # captured example (HR_DEBUG_TOMORROW.md Snippet 3 is the planned path
+    # to capture one). Until that capture lands, we get Backend-mode parity
+    # by reusing the Frontend UI-click flow per candidate:
+    #
+    #   1. Click into the first candidate in the list sidebar.
+    #   2. Call _download_application_data_frontend() — same helper Frontend
+    #      mode already uses — to pop the kebab menu, open the modal, tick
+    #      HTML + JSON, click Download files, move files into per-candidate
+    #      folder.
+    #   3. Advance via _go_to_next_candidate() and repeat.
+    #
+    # Every candidate gets app-data; dedup via the existing
+    # checkpoint_data['downloaded_application_data'] list so reruns don't
+    # re-click. _maybe_capture_app_data_urls() records whatever the browser
+    # actually hit during the first candidate so a future build can upgrade
+    # this to pure-API.
+
+    def _click_first_candidate_in_list(self) -> bool:
+        """Click the first row in the candidate-list sidebar so subsequent
+        _go_to_next_candidate() calls have a current row to advance from."""
+        try:
+            return bool(self.driver.execute_script("""
+                const items = document.querySelectorAll(
+                    '#hanselCandidateListContainer > div > ul > li[data-testid="CandidateListItem"]'
+                );
+                if (!items.length) return false;
+                const btn = items[0].querySelector('button[data-testid="CandidateListItem-button"]');
+                if (!btn) return false;
+                items[0].scrollIntoView({block: 'center'});
+                btn.click();
+                return true;
+            """))
+        except Exception:
+            return False
+
+    def _maybe_capture_app_data_urls(self) -> None:
+        """Best-effort: scrape Chrome's performance log for XHR URLs that
+        match known app-data patterns and append them to
+        logs/app_data_urls.json. Used to bootstrap a Stage-2 pure-API
+        upgrade without requiring HR to paste DevTools output."""
+        try:
+            logs = self.driver.get_log('performance')
+        except Exception:
+            return
+
+        found = []
+        for log in logs:
+            try:
+                msg = json.loads(log['message'])['message']
+                method = msg.get('method', '')
+                if method not in ('Network.requestWillBeSent', 'Network.responseReceived'):
+                    continue
+                params = msg.get('params', {}) or {}
+                url = (params.get('request') or params.get('response') or {}).get('url', '')
+                if not url:
+                    continue
+                if not re.search(r'application|cao_post_body|original-application', url, re.I):
+                    continue
+                if 'graphql' in url:
+                    continue
+                entry = {
+                    'direction': 'request' if method == 'Network.requestWillBeSent' else 'response',
+                    'url': url,
+                }
+                if method == 'Network.requestWillBeSent':
+                    req = params.get('request') or {}
+                    entry['http_method'] = req.get('method')
+                    entry['has_body'] = bool(req.get('postData'))
+                found.append(entry)
+            except (KeyError, json.JSONDecodeError):
+                continue
+
+        if not found:
+            return
+
+        try:
+            out_file = Path(self.log_folder) / 'app_data_urls.json'
+            existing = []
+            if out_file.exists():
+                try:
+                    with open(out_file, 'r', encoding='utf-8') as f:
+                        existing = json.load(f) or []
+                except (json.JSONDecodeError, IOError):
+                    existing = []
+            seen = {(e.get('direction'), e.get('url')) for e in existing if isinstance(e, dict)}
+            for entry in found:
+                key = (entry.get('direction'), entry.get('url'))
+                if key not in seen:
+                    existing.append(entry)
+                    seen.add(key)
+            with open(out_file, 'w', encoding='utf-8') as f:
+                json.dump(existing, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _run_app_data_pass_backend(self) -> None:
+        """Run the UI-driven app-data download flow over every candidate
+        for the currently active job. Called after Backend-mode CV download
+        so CVs land fast via API, then app-data is collected sequentially."""
+        if not self.download_app_data:
+            return
+        if not self.current_job_folder:
+            print("   ⚠ Skipping app-data pass: no job folder set.")
+            return
+
+        print("\n📎 App-data pass (HTML + JSON per candidate via the browser)...")
+
+        # Ensure we're on the candidate list for this job. Backend CV
+        # download leaves the browser on the list page, but re-navigating
+        # to the job's own URL (when we have one) guarantees we start from
+        # candidate #1 rather than whichever one HR had selected manually.
+        target_url = None
+        if self.current_job_id:
+            target_url = f"https://employers.indeed.com/candidates?selectedJobs={self.current_job_id}"
+        current = self.driver.current_url or ''
+        if target_url and (self.current_job_id not in current or 'candidates' not in current):
+            try:
+                self.driver.get(target_url)
+                time.sleep(3)
+            except Exception:
+                pass
+        elif 'candidates' not in current:
+            try:
+                self.driver.get('https://employers.indeed.com/candidates')
+                time.sleep(3)
+            except Exception:
+                pass
+
+        if not self._click_first_candidate_in_list():
+            print("   ⚠ Could not click the first candidate — skipping app-data pass.")
+            return
+
+        time.sleep(self.next_candidate_delay)
+
+        pbar = tqdm(desc="   App data")
+        discovered = False
+        try:
+            while True:
+                name = self._get_current_candidate_name()
+                if not name:
+                    break
+                candidate_folder = self._create_candidate_folder(name)
+                already_done = name in self.checkpoint_data.get('downloaded_application_data', [])
+                if not already_done:
+                    if self._download_application_data_frontend(name, candidate_folder):
+                        self._save_checkpoint(name=name, app_data=True)
+                        self.stats['app_data_downloaded'] += 1
+                        if not discovered:
+                            self._maybe_capture_app_data_urls()
+                            discovered = True
+                pbar.update(1)
+                if not self._go_to_next_candidate():
+                    break
+                time.sleep(self.next_candidate_delay)
+        finally:
+            pbar.close()
+
     # ==================== FRONTEND MODE (Selenium) ====================
 
     def run_frontend_single_job(self):
