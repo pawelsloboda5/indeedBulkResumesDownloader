@@ -2027,6 +2027,14 @@ class IndeedDownloader:
 
         pbar = tqdm(desc="   App data")
         discovered = False
+        # Outcome counters for the end-of-pass summary event. Without these
+        # a systemic per-candidate click failure (e.g., Indeed renames the
+        # kebab button) would show up only as "app_data_downloaded: 0" in
+        # final stats — no reason in the log.
+        processed = 0
+        succeeded = 0
+        failed = 0
+        skipped_already_done = 0
         try:
             while True:
                 name = self._get_current_candidate_name()
@@ -2034,19 +2042,43 @@ class IndeedDownloader:
                     break
                 candidate_folder = self._create_candidate_folder(name)
                 already_done = name in self.checkpoint_data.get('downloaded_application_data', [])
-                if not already_done:
+                if already_done:
+                    skipped_already_done += 1
+                else:
                     if self._download_application_data_frontend(name, candidate_folder):
                         self._save_checkpoint(name=name, app_data=True)
                         self.stats['app_data_downloaded'] += 1
+                        succeeded += 1
                         if not discovered:
                             self._maybe_capture_app_data_urls()
                             discovered = True
+                    else:
+                        failed += 1
+                        # Dump DOM state on the FIRST failure only — enough
+                        # for triage, doesn't spam the log on repeat fails.
+                        if self.log and failed == 1:
+                            self._log_app_data_pass_abort('first_candidate_helper_returned_false')
+                processed += 1
                 pbar.update(1)
                 if not self._go_to_next_candidate():
                     break
                 time.sleep(self.next_candidate_delay)
         finally:
             pbar.close()
+            if self.log:
+                self.log.event('app_data_pass_summary', {
+                    'processed': processed,
+                    'succeeded': succeeded,
+                    'failed': failed,
+                    'skipped_already_done': skipped_already_done,
+                })
+            # Console-visible outcome so HR knows if something went wrong
+            # without having to read the log file.
+            if failed > 0:
+                print(f"   ⚠ App-data pass: {succeeded} saved, {failed} failed, {skipped_already_done} already on disk.")
+                print("     (Details written to logs/latest.log — first failure's DOM state was captured.)")
+            else:
+                print(f"   ✅ App-data pass: {succeeded} saved ({skipped_already_done} already on disk).")
 
     # ==================== FRONTEND MODE (Selenium) ====================
 
