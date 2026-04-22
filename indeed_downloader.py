@@ -1271,6 +1271,16 @@ class IndeedDownloader:
         surface_context.append({"contextKey": "SORT_BY", "contextPayload": sort_by})
         surface_context.append({"contextKey": "SORT_ORDER", "contextPayload": sort_order})
 
+        # Indeed's schema declares `identifiers: OrchestrationIdentifiersInput!`
+        # (non-null) — omitting the field yields
+        # "missing input value at `$input.identifiers`" and 0 results, as
+        # seen in logs/run_20260421_204255.log. The live dashboard ALWAYS
+        # sends this key, using an empty `jobIdentifiers` dict for unscoped
+        # queries (see indeed_graphql_1.txt). Match that shape here.
+        job_identifiers = {}
+        if self.current_job_id:
+            job_identifiers["employerJobId"] = self.current_job_id
+
         variables = {
             "input": {
                 "clientSurfaceName": "candidate-list-page",
@@ -1279,22 +1289,18 @@ class IndeedDownloader:
                 "offset": offset,
                 "context": {
                     "surfaceContext": surface_context
-                }
+                },
+                "identifiers": {"jobIdentifiers": job_identifiers},
             }
         }
-
-        if self.current_job_id:
-            variables["input"]["identifiers"] = {
-                "jobIdentifiers": {"employerJobId": self.current_job_id}
-            }
 
         payload = {"operationName": "FindRCPMatches", "variables": variables, "query": query}
 
         # One-time query-shape log per pagination run, to aid diagnosis without
         # being noisy. Printed only on offset=0.
         if offset == 0:
-            ids = variables["input"].get("identifiers", {})
-            print(f"   🔎 Query: jobIdentifiers={ids or '{} (all jobs)'}, dispositions={len(dispositions)}, limit={limit}")
+            scope = f"employerJobId={self.current_job_id[:24]}..." if self.current_job_id else "unscoped (all jobs)"
+            print(f"   🔎 Query: {scope}, dispositions={len(dispositions)}, limit={limit}")
 
         # Abort early on missing auth instead of sending the literal string
         # "None" as the indeed-api-key header (Python f-string would stringify
@@ -1415,8 +1421,10 @@ class IndeedDownloader:
     def run_backend_single_job(self):
         """Run backend mode for single job"""
         print("\n" + "=" * 60)
-        print("👆 Navigate to the desired job in Chrome")
-        print("   then press Enter")
+        print("👆 Navigate to the desired job in Chrome, then press Enter.")
+        print("   Tip: click the job title in your Jobs list — you should land")
+        print("   on THAT JOB's candidates page. The global 'All Candidates'")
+        print("   view (statusName=All) won't work; pick one specific job.")
         print("=" * 60)
         input()
 
@@ -1428,9 +1436,38 @@ class IndeedDownloader:
         # missing auth token, wrong scope, etc).
         print(f"\n🔎 Diagnostics:")
         print(f"   URL: {job_url}")
-        print(f"   Extracted job IRI: {self.current_job_id or '(none — query will cover ALL jobs)'}")
+        print(f"   Extracted job IRI: {self.current_job_id or '(none)'}")
         print(f"   API key: {self.api_key[:12] + '...' if self.api_key else '(MISSING — auth may have failed)'}")
         print(f"   CTK:     {self.ctk or '(MISSING — auth may have failed)'}")
+
+        # Single-mode guard: if we couldn't pull a job IRI from the URL, bail
+        # out instead of silently falling through to an unscoped GraphQL
+        # query — that path (a) isn't what the user asked for in Single mode,
+        # (b) dumps everything into `Job_unknown/`, and (c) used to crash on
+        # Indeed's schema because `identifiers` is required. First seen in
+        # logs/run_20260421_204255.log where HR was on `?statusName=All&id=0`.
+        if not self.current_job_id:
+            print("\n❌ Single-job mode needs a specific job.")
+            print("   Your URL doesn't include `selectedJobs=...`, which means")
+            print("   you're probably on the global 'All Candidates' pipeline")
+            print("   instead of one job's candidate list.")
+            print("\n   What to do:")
+            print("   1. In Chrome, go back to your Jobs list.")
+            print("   2. Click the job title you want to download.")
+            print("   3. Confirm the URL looks like:")
+            print("         employers.indeed.com/candidates?selectedJobs=aXJp...")
+            print("   4. Re-run the tool.")
+            print("\n   (If your URL uses `employerJobId=` or some other parameter")
+            print("    instead of `selectedJobs=`, send the full URL to Pawel —")
+            print("    the parser may need an update for your account shape.)")
+            if self.log:
+                self.log.event('single_job_abort', {
+                    'reason': 'no_job_iri_in_url',
+                    'url': job_url,
+                    'has_api_key': bool(self.api_key),
+                    'has_ctk': bool(self.ctk),
+                })
+            return
 
         # Get job name from page. The first selector the page exposes may be
         # the generic "Candidates" h1 (not the job title) depending on which
