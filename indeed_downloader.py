@@ -35,7 +35,7 @@ load_dotenv('.env.config')
 
 # Bumped whenever the binary layout changes. Shown in log headers so bug
 # reports are pinned to a known build.
-TOOL_VERSION = "2026-04-23-app-data-step-instrumentation"
+TOOL_VERSION = "2026-04-23-app-data-correct-profile-url"
 
 
 class RunLogger:
@@ -205,7 +205,8 @@ class IndeedDownloader:
         self.cookies = {}
 
         # Current job info
-        self.current_job_id = None
+        self.current_job_id = None         # IRI from URL `selectedJobs=` (used by GraphQL)
+        self.current_job_legacy_id = None  # Short id from URL `id=` (used by /candidates/view profile URL as `legacyJobId=`)
         self.current_job_name = None
         self.current_job_folder = None
         self.current_job_is_existing = False  # True if job folder already existed
@@ -1430,6 +1431,21 @@ class IndeedDownloader:
 
         job_url = self.driver.current_url
         self.current_job_id = self._extract_job_id_from_url(job_url)
+        # Also pull the SHORT job id from the `id=` query param on the list
+        # URL. It's the same identifier Indeed surfaces as `legacyJobId=` on
+        # /candidates/view profile URLs — needed by the app-data pass to load
+        # individual candidate profiles. Distinct from `selectedJobs=` (IRI)
+        # and from any candidate `id=` you'd see on a profile URL. `id=0` is
+        # the All-Candidates pipeline marker (Single-mode guard rejects that
+        # case anyway via the missing `selectedJobs=`).
+        self.current_job_legacy_id = None
+        try:
+            params = parse_qs(urlparse(job_url).query)
+            short_id = params.get('id', [None])[0]
+            if short_id and short_id != '0':
+                self.current_job_legacy_id = short_id
+        except (ValueError, KeyError, IndexError):
+            pass
 
         # Diagnostic snapshot — prints once per run, helps trace any
         # "0 candidates" failure to its actual cause (bad URL extraction,
@@ -1437,6 +1453,7 @@ class IndeedDownloader:
         print(f"\n🔎 Diagnostics:")
         print(f"   URL: {job_url}")
         print(f"   Extracted job IRI: {self.current_job_id or '(none)'}")
+        print(f"   Job legacy id:     {self.current_job_legacy_id or '(none — app-data pass may fall back)'}")
         print(f"   API key: {self.api_key[:12] + '...' if self.api_key else '(MISSING — auth may have failed)'}")
         print(f"   CTK:     {self.ctk or '(MISSING — auth may have failed)'}")
 
@@ -2046,7 +2063,14 @@ class IndeedDownloader:
                 self.log.event('app_data_pass_abort', {'reason': 'no_candidates_list'})
             return
 
-        job_iri_encoded = quote(self.current_job_id, safe='') if self.current_job_id else ''
+        # Per-candidate profile URLs target the DETAIL view at /candidates/view
+        # (NOT the list view at /candidates). On the detail view, `id=` is the
+        # candidate's legacy id and `legacyJobId=` is the JOB short id; on the
+        # list view, `id=` is the JOB short id and we'd be putting the candidate
+        # id in the wrong slot — landing on a misconfigured list page where the
+        # "Download application data" menu item doesn't exist. That was the
+        # 0/331 failure in logs/run_20260422_203651.log.
+        job_legacy_encoded = quote(self.current_job_legacy_id, safe='') if self.current_job_legacy_id else ''
 
         print(f"\n📎 App-data pass — visiting each of {len(candidates_list)} candidate profiles directly...")
 
@@ -2088,16 +2112,20 @@ class IndeedDownloader:
 
                 candidate_folder = self._create_candidate_folder(name)
 
-                # Navigate to this candidate's profile. Passing selectedJobs
-                # alongside id keeps the job context so the kebab menu shows
-                # the right set of actions.
-                if job_iri_encoded:
+                # Navigate to this candidate's profile-DETAIL view. `legacyJobId`
+                # carries the job context so the profile's kebab menu includes
+                # "Download application data" instead of just the generic row
+                # actions. Fall back to id-only if we didn't capture a job
+                # legacy id (unusual but possible if Indeed's URL shape changes);
+                # page may still resolve via session state.
+                candidate_id_encoded = quote(legacy_id, safe='')
+                if job_legacy_encoded:
                     profile_url = (
-                        f"https://employers.indeed.com/candidates"
-                        f"?id={legacy_id}&selectedJobs={job_iri_encoded}"
+                        f"https://employers.indeed.com/candidates/view"
+                        f"?id={candidate_id_encoded}&legacyJobId={job_legacy_encoded}"
                     )
                 else:
-                    profile_url = f"https://employers.indeed.com/candidates?id={legacy_id}"
+                    profile_url = f"https://employers.indeed.com/candidates/view?id={candidate_id_encoded}"
 
                 try:
                     self.driver.get(profile_url)
