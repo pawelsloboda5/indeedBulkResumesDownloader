@@ -35,7 +35,7 @@ load_dotenv('.env.config')
 
 # Bumped whenever the binary layout changes. Shown in log headers so bug
 # reports are pinned to a known build.
-TOOL_VERSION = "2026-04-20-app-data-via-profile-urls"
+TOOL_VERSION = "2026-04-23-app-data-step-instrumentation"
 
 
 class RunLogger:
@@ -2056,6 +2056,12 @@ class IndeedDownloader:
         failed = 0
         skipped_already_done = 0
         first_failure_logged = False
+        consecutive_failures = 0
+        # Pull the plug after this many in-a-row helper failures. At 5×20s=100s
+        # we've spent enough to prove it's systemic (DOM change), not flaky.
+        # Saves HR hours of silent grinding like logs/run_20260422_203651.log
+        # (331 candidates × 20s each = 1h48m of 100% failure before we noticed).
+        EARLY_ABORT_THRESHOLD = 5
 
         pbar = tqdm(total=len(candidates_list), desc="   App data")
         try:
@@ -2117,14 +2123,43 @@ class IndeedDownloader:
                     self._save_checkpoint(name=name, app_data=True)
                     self.stats['app_data_downloaded'] += 1
                     succeeded += 1
+                    consecutive_failures = 0
                     if not discovered:
                         self._maybe_capture_app_data_urls()
                         discovered = True
                 else:
                     failed += 1
+                    consecutive_failures += 1
+                    step = getattr(self, '_last_helper_failure_step', None) or 'unknown'
+                    if self.log:
+                        # Lightweight per-candidate event so we can tell HR
+                        # exactly which DOM lookup died, for every candidate
+                        # that failed — not just the first.
+                        self.log.event('app_data_helper_step_fail', {
+                            'step': step,
+                            'candidate': name,
+                        })
                     if self.log and not first_failure_logged:
-                        self._log_app_data_pass_abort('helper_returned_false_on_profile')
+                        self._log_app_data_pass_abort(f'helper_returned_false:{step}')
                         first_failure_logged = True
+
+                    if consecutive_failures >= EARLY_ABORT_THRESHOLD:
+                        # Likely a DOM change; stop flogging a dead horse.
+                        print(f"\n   ⚠ App-data pass: aborting after {consecutive_failures} "
+                              f"consecutive failures on step '{step}'.")
+                        print( "     Indeed probably renamed that element. Per-candidate "
+                               "'app_data_helper_step_fail' events are in logs/latest.log —")
+                        print( "     share with Pawel and the selector list can be patched.")
+                        if self.log:
+                            self.log.event('app_data_pass_early_abort', {
+                                'consecutive_failures': consecutive_failures,
+                                'last_step': step,
+                                'processed': processed + 1,
+                                'remaining': len(candidates_list) - (processed + 1),
+                            })
+                        processed += 1
+                        pbar.update(1)
+                        break
 
                 processed += 1
                 pbar.update(1)
@@ -2409,10 +2444,24 @@ class IndeedDownloader:
             return False
 
     def _download_application_data_frontend(self, name: str, candidate_folder: Path) -> bool:
-        """Automate the "..." -> Download application data -> check boxes -> Download files flow."""
+        """Automate the "..." -> Download application data -> check boxes -> Download files flow.
+
+        On failure, sets `self._last_helper_failure_step` to one of:
+          'kebab_in_helper' — outer wait saw kebab but re-lookup in helper failed (stale/race)
+          'menu_item'       — clicked kebab, "Download application data" menuitem text not found
+          'modal'           — clicked menuitem, modal/dialog with that heading not found
+          'checkbox_html'   — modal open, no row matching `-original-application(.html)?`
+          'checkbox_json'   — modal open, no row matching `cao_post_body`
+          'confirm'         — checkboxes ticked, "Download files" submit button not found
+          'files'           — confirm clicked, expected files never landed in job folder
+          'exception'       — something threw; see stderr for traceback
+        Outer caller reads this for logging and early-abort.
+        """
+        self._last_helper_failure_step = None
         try:
             kebab = self._find_element_by_selectors(self._KEBAB_MENU_SELECTORS, timeout_per=1.5)
             if not kebab:
+                self._last_helper_failure_step = 'kebab_in_helper'
                 return False
             self.driver.execute_script(
                 "arguments[0].scrollIntoView({block: 'center'}); arguments[0].click();", kebab
@@ -2421,6 +2470,7 @@ class IndeedDownloader:
 
             item = self._find_element_by_selectors(self._APP_DATA_MENU_ITEM_SELECTORS, timeout_per=1.5)
             if not item:
+                self._last_helper_failure_step = 'menu_item'
                 try:
                     self.driver.execute_script("document.body.click();")
                 except Exception:
@@ -2431,6 +2481,7 @@ class IndeedDownloader:
 
             modal = self._find_element_by_selectors(self._APP_DATA_MODAL_SELECTORS, timeout_per=3)
             if not modal:
+                self._last_helper_failure_step = 'modal'
                 try:
                     self.driver.execute_script("document.body.click();")
                 except Exception:
@@ -2438,9 +2489,16 @@ class IndeedDownloader:
                 return False
 
             # Tick HTML + JSON; skip PDF (already downloaded as the resume).
-            html_ok = self._check_app_data_box(r'-original-application\.html|original-application', modal)
-            json_ok = self._check_app_data_box(r'cao_post_body', modal)
-            if not (html_ok and json_ok):
+            # Checked separately so failure is attributable to one or the other.
+            if not self._check_app_data_box(r'-original-application\.html|original-application', modal):
+                self._last_helper_failure_step = 'checkbox_html'
+                try:
+                    self.driver.execute_script("document.body.click();")
+                except Exception:
+                    pass
+                return False
+            if not self._check_app_data_box(r'cao_post_body', modal):
+                self._last_helper_failure_step = 'checkbox_json'
                 try:
                     self.driver.execute_script("document.body.click();")
                 except Exception:
@@ -2449,6 +2507,7 @@ class IndeedDownloader:
 
             confirm = self._find_element_by_selectors(self._APP_DATA_CONFIRM_SELECTORS, timeout_per=1.5)
             if not confirm:
+                self._last_helper_failure_step = 'confirm'
                 try:
                     self.driver.execute_script("document.body.click();")
                 except Exception:
@@ -2456,9 +2515,13 @@ class IndeedDownloader:
                 return False
             self.driver.execute_script("arguments[0].click();", confirm)
 
-            return self._move_application_files(name, candidate_folder)
+            if not self._move_application_files(name, candidate_folder):
+                self._last_helper_failure_step = 'files'
+                return False
+            return True
 
         except Exception:
+            self._last_helper_failure_step = 'exception'
             try:
                 self.driver.execute_script("document.body.click();")
             except Exception:
