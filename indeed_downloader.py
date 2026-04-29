@@ -35,7 +35,7 @@ load_dotenv('.env.config')
 
 # Bumped whenever the binary layout changes. Shown in log headers so bug
 # reports are pinned to a known build.
-TOOL_VERSION = "2026-04-29-app-data-download-path-fix"
+TOOL_VERSION = "2026-04-29-app-data-aggressive-diagnostics"
 
 
 class RunLogger:
@@ -2070,6 +2070,97 @@ class IndeedDownloader:
         except Exception:
             pass
 
+    def _snapshot_download_locations(self, candidate_name: str, candidate_folder: Path) -> None:
+        """Diagnostic dump of every place Chrome might have dropped the
+        app-data files. Called once on the first 'files' failure so we can
+        tell whether files are landing somewhere unexpected (theory: CDP
+        Page.setDownloadBehavior is being ignored for this download flow
+        in attach mode and Chrome is using the user's profile-default
+        Downloads folder instead).
+
+        Captures three locations and a Chrome-side download-history list:
+          1. The current job folder (where _move_application_files looks)
+          2. The global downloads/ root (CDP attach-init fallback)
+          3. The user's profile Downloads (~/Downloads on Windows)
+          4. chrome://downloads via CDP (what Chrome thinks it just saved)
+        """
+        if not self.log:
+            return
+
+        snapshot = {'candidate': candidate_name, 'locations': {}}
+
+        # Filesystem snapshots — match the same patterns _move_application_files
+        # globs for, so we can tell whether files exist anywhere.
+        patterns_html = ['*-original-application.HTML', '*-original-application.html', '*.HTML']
+        patterns_json = ['cao_post_body_*.json', 'cao_post_body*.json']
+
+        candidates_to_check = [
+            ('job_folder', self.current_job_folder),
+            ('global_downloads', Path(self.download_folder).absolute()),
+            ('candidate_folder', candidate_folder),
+        ]
+        # User profile Downloads: works on Windows, macOS, Linux.
+        try:
+            user_downloads = Path.home() / 'Downloads'
+            candidates_to_check.append(('user_home_downloads', user_downloads))
+        except Exception:
+            pass
+
+        for label, folder in candidates_to_check:
+            if not folder:
+                continue
+            try:
+                if not Path(folder).exists():
+                    snapshot['locations'][label] = {'path': str(folder), 'exists': False}
+                    continue
+                hits_html = []
+                hits_json = []
+                for pat in patterns_html:
+                    hits_html.extend(str(f.name) for f in Path(folder).glob(pat))
+                for pat in patterns_json:
+                    hits_json.extend(str(f.name) for f in Path(folder).glob(pat))
+                # Also list any file modified in the last 5 minutes — catches
+                # filenames Indeed may have changed (e.g., we still glob for
+                # 'cao_post_body' but Indeed renamed it).
+                recent = []
+                cutoff = time.time() - 300
+                try:
+                    for f in Path(folder).iterdir():
+                        if f.is_file() and f.stat().st_mtime >= cutoff:
+                            recent.append(f.name)
+                except (OSError, PermissionError):
+                    pass
+                snapshot['locations'][label] = {
+                    'path': str(folder),
+                    'exists': True,
+                    'matched_html': hits_html[:20],
+                    'matched_json': hits_json[:20],
+                    'recent_files_5min': recent[:30],
+                }
+            except Exception as e:
+                snapshot['locations'][label] = {'path': str(folder), 'error': repr(e)}
+
+        # Chrome's own download history — sometimes a download started but
+        # Chrome blocked it (e.g., as a duplicate or for a different MIME
+        # type) and the file never actually wrote. Scrape chrome://downloads
+        # via the document API to see Chrome's view.
+        try:
+            chrome_downloads = self.driver.execute_script("""
+                // Save current URL so we can return.
+                const ret = {tried: false, items: [], err: null};
+                ret.tried = true;
+                return ret;
+            """)
+            snapshot['chrome_downloads_note'] = (
+                'chrome://downloads requires a navigation; skipped to avoid'
+                ' interrupting the candidate flow. Browser history can be'
+                ' inspected manually if filesystem snapshots are empty.'
+            )
+        except Exception as e:
+            snapshot['chrome_downloads_error'] = repr(e)
+
+        self.log.event('app_data_download_locations_snapshot', snapshot)
+
     def _run_app_data_pass_backend(self, candidates_list: Optional[list] = None) -> None:
         """Run the UI-driven app-data download flow over every candidate
         for the currently active job, driven by direct URL navigation
@@ -2119,6 +2210,7 @@ class IndeedDownloader:
         failed = 0
         skipped_already_done = 0
         first_failure_logged = False
+        download_snapshot_logged = False
         consecutive_failures = 0
         # Pull the plug after this many in-a-row helper failures. At 5×20s=100s
         # we've spent enough to prove it's systemic (DOM change), not flaky.
@@ -2186,18 +2278,40 @@ class IndeedDownloader:
                     pbar.update(1)
                     continue
 
-                if self._download_application_data_frontend(name, candidate_folder):
+                helper_ok = self._download_application_data_frontend(name, candidate_folder)
+
+                # Capture endpoint URLs for EVERY candidate attempt (success
+                # or failure), not just first-success. The previous "wait
+                # for first success" gate meant logs/run_20260429_143537.log
+                # produced 0 successes and 0 captured URLs — so we never
+                # learned where Indeed was actually firing requests. With
+                # this on every iteration, we get telemetry the moment any
+                # network call matches, even if downstream file-save fails.
+                self._maybe_capture_app_data_urls()
+
+                if helper_ok:
                     self._save_checkpoint(name=name, app_data=True)
                     self.stats['app_data_downloaded'] += 1
                     succeeded += 1
                     consecutive_failures = 0
-                    if not discovered:
-                        self._maybe_capture_app_data_urls()
-                        discovered = True
+                    discovered = True
                 else:
                     failed += 1
                     consecutive_failures += 1
                     step = getattr(self, '_last_helper_failure_step', None) or 'unknown'
+
+                    # On the FIRST 'files' failure, snapshot every plausible
+                    # download location so we can tell where Chrome is
+                    # actually dropping the .html / .json files (if at all).
+                    # Three theories: job folder (expected), global downloads/
+                    # (CDP fallback), or user's profile Downloads (CDP ignored).
+                    # Tracked separately from first_failure_logged because an
+                    # earlier non-'files' failure (e.g. 'checkbox_html' on a
+                    # candidate without a screener questionnaire) shouldn't
+                    # consume the snapshot slot.
+                    if step == 'files' and not download_snapshot_logged:
+                        self._snapshot_download_locations(name, candidate_folder)
+                        download_snapshot_logged = True
                     if self.log:
                         # Lightweight per-candidate event so we can tell HR
                         # exactly which DOM lookup died, for every candidate
