@@ -12,6 +12,7 @@ import re
 import base64
 import shutil
 import subprocess
+import unicodedata
 from urllib.parse import urlparse, parse_qs, unquote, quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -35,7 +36,7 @@ load_dotenv('.env.config')
 
 # Bumped whenever the binary layout changes. Shown in log headers so bug
 # reports are pinned to a known build.
-TOOL_VERSION = "2026-04-29-app-data-json-api-with-429-backoff"
+TOOL_VERSION = "2026-04-29-csrf-from-perflog-plus-late-claim"
 
 
 class RunLogger:
@@ -2347,17 +2348,34 @@ class IndeedDownloader:
                 time.sleep(self.next_candidate_delay)
         finally:
             pbar.close()
+
+            # Late-claim sweep: pick up any HTML files that landed in the
+            # job folder after _move_application_files gave up but before
+            # the loop exited (OneDrive lag, late Chrome finalize, etc).
+            # Matches by candidate-name slug so we don't grab someone
+            # else's file. Each rescued file bumps the success count.
+            late_claimed = self._late_claim_application_html(candidates_list)
+            if late_claimed > 0:
+                succeeded += late_claimed
+                failed = max(0, failed - late_claimed)
+                if self.log:
+                    self.log.event('app_data_late_claim_summary', {'count': late_claimed})
+
             if self.log:
                 self.log.event('app_data_pass_summary', {
                     'processed': processed,
                     'succeeded': succeeded,
                     'failed': failed,
                     'skipped_already_done': skipped_already_done,
+                    'late_claimed': late_claimed,
                 })
             # Console-visible outcome so HR knows if something went wrong
             # without having to read the log file.
             if failed > 0:
-                print(f"   ⚠ App-data pass: {succeeded} saved, {failed} failed, {skipped_already_done} already on disk.")
+                msg = f"   ⚠ App-data pass: {succeeded} saved, {failed} failed, {skipped_already_done} already on disk."
+                if late_claimed > 0:
+                    msg += f" (+{late_claimed} rescued via late-claim)"
+                print(msg)
                 print("     (Details written to logs/latest.log — first failure's DOM state was captured.)")
             else:
                 print(f"   ✅ App-data pass: {succeeded} saved ({skipped_already_done} already on disk).")
@@ -2718,39 +2736,83 @@ class IndeedDownloader:
                 pass
             return False
 
+    @staticmethod
+    def _candidate_name_slug(name: str) -> str:
+        """Convert a candidate display name into the lowercase-hyphen form
+        Indeed uses in app-data filenames (e.g., "MALLORY MARNEY" →
+        "mallory-marney"). Used to scope file globs to ONE candidate, so
+        stragglers in the job folder from prior iterations can't confuse
+        the move logic.
+        """
+        if not name:
+            return ''
+        s = unicodedata.normalize('NFKD', name)
+        s = ''.join(ch for ch in s if not unicodedata.combining(ch))
+        s = s.lower()
+        # Indeed uses hyphens between word parts and dashes for periods
+        # in name suffixes (e.g., "T.J." → "t.j.-blazer" — keep dots).
+        s = re.sub(r'[^a-z0-9.\s-]', '', s)
+        s = re.sub(r'\s+', '-', s).strip('-')
+        return s
+
     def _move_application_files(self, name: str, candidate_folder: Path) -> bool:
         """Wait for Chrome to drop the HTML application file in the job
         folder, then move + rename it into the candidate folder as
-        application.html. Returns True iff the HTML arrived within ~15s.
+        application.html. Returns True iff the HTML arrived within ~30s.
 
-        Snapshots pre-existing matching files at call time so stragglers
-        from a previous candidate's still-streaming download don't get
-        misattributed to this candidate.
+        Why we glob by candidate-name slug: previous build globbed
+        '*-original-application.HTML' and excluded files in pre_existing
+        snapshot, but on OneDrive paths (which HR uses) Chrome's download
+        + Windows file lock + OneDrive sync can race in ways that made
+        rename() fail and leave the file orphaned in the job folder
+        (logs/run_20260429_155223.log: 5 candidates' HTML files visibly
+        present in job folder, none moved into per-candidate folders).
+        Scoping to slug avoids the cross-candidate confusion entirely —
+        we only touch THIS candidate's file, no matter when it landed.
 
         JSON note: the modal's "raw JSON" checkbox no longer triggers a
-        Chrome download as of 2026-04-29 (Indeed UI change — verified in
-        logs/run_20260429_145657.log). JSON is fetched separately in
-        _fetch_application_json_via_page() via Indeed's iq/job/answers
-        endpoint, after this helper returns.
+        Chrome download as of 2026-04-29 (Indeed UI change). JSON is
+        fetched separately in _fetch_application_json_via_page() via
+        Indeed's iq/job/answers endpoint, after this helper returns.
         """
         job_folder = self.current_job_folder or Path(self.download_folder)
         html_target = candidate_folder / "application.html"
+        slug = self._candidate_name_slug(name)
 
         def _find_html_matches():
+            # Slug-scoped first (most-specific match), then generic fallback
+            # for the rare case Indeed serves a different filename pattern.
+            specific = []
+            if slug:
+                specific = (
+                    list(job_folder.glob(f"{slug}-original-application.HTML"))
+                    + list(job_folder.glob(f"{slug}-original-application.html"))
+                    + list(job_folder.glob(f"{slug}*.HTML"))
+                    + list(job_folder.glob(f"{slug}*.html"))
+                )
+            if specific:
+                return specific
+            # Generic fallback: only used if slug had no matches. In a
+            # multi-candidate run this could pick up someone else's file,
+            # but we de-duplicate via the html_target uniqueness — once we
+            # rename a file to candidate_folder/application.html, no other
+            # candidate's flow will touch that location.
             return (
                 list(job_folder.glob("*-original-application.HTML"))
                 + list(job_folder.glob("*-original-application.html"))
                 + list(job_folder.glob("*.HTML"))
             )
 
-        pre_existing_html = set(_find_html_matches())
         html_found = html_target.exists()
 
-        for _ in range(30):  # up to ~15s
+        # Bumped 15s → 30s. HR's setup is on OneDrive
+        # (C:\Users\nikki\OneDrive\...) which adds noticeable latency to
+        # Chrome's download finalize → Windows rename → OneDrive index
+        # pipeline. Files were verifiably landing but after the old 15s
+        # cutoff (logs/run_20260429_155223.log download_locations_snapshot).
+        for _ in range(60):  # up to ~30s
             if not html_found:
                 for f in _find_html_matches():
-                    if f in pre_existing_html:
-                        continue
                     if f.is_file() and f.stat().st_size > 0:
                         try:
                             if html_target.exists():
@@ -2759,6 +2821,8 @@ class IndeedDownloader:
                             html_found = True
                             break
                         except OSError:
+                            # OneDrive may briefly lock the file during sync;
+                            # try again on the next poll instead of giving up.
                             pass
 
             if html_found:
@@ -2766,6 +2830,107 @@ class IndeedDownloader:
             time.sleep(0.5)
 
         return html_found
+
+    def _discover_csrf_from_perflog(self) -> Optional[str]:
+        """Scan Chrome's performance log for any URL that includes
+        `indeedcsrftoken=<value>`. Indeed's own page fires this token in
+        URLs (the iq/job/answers GET during the modal flow is the
+        reliable one), so passive capture from the perf-log buffer is
+        sufficient. Returns the token (32+ hex chars) or None.
+
+        Cached by the caller on self._indeed_csrf_token after first
+        discovery — the token is session-scoped and stable for the run.
+        """
+        try:
+            logs = self.driver.get_log('performance')
+        except Exception:
+            return None
+
+        pattern = re.compile(r'indeedcsrftoken=([a-f0-9]{16,})', re.IGNORECASE)
+        for entry in logs:
+            try:
+                msg = json.loads(entry['message'])['message']
+                method = msg.get('method', '')
+                if method not in ('Network.requestWillBeSent', 'Network.responseReceived'):
+                    continue
+                params = msg.get('params', {}) or {}
+                url = (params.get('request') or params.get('response') or {}).get('url', '')
+                if not url:
+                    continue
+                m = pattern.search(url)
+                if m:
+                    return m.group(1)
+            except (KeyError, json.JSONDecodeError):
+                continue
+        return None
+
+    def _late_claim_application_html(self, candidates_list: list) -> int:
+        """After an app-data pass ends (early-abort or natural finish),
+        sweep the job folder for any HTML files that Chrome dropped but
+        we never moved into per-candidate folders. Match by candidate-
+        name slug, move into candidate folder, mark in checkpoint, bump
+        success count. Returns the count of files claimed.
+
+        Why this exists: even with the bumped wait + slug-scoped match,
+        a few candidates can still have their HTML land just past the
+        deadline (OneDrive lag is unpredictable). Without this sweep
+        those files sit orphaned in the job folder and would need a
+        manual move. With it, HR's run that aborted on the 5th-failure
+        threshold still reaps real successes from the partially-completed
+        downloads.
+        """
+        if not self.current_job_folder:
+            return 0
+        job_folder = self.current_job_folder
+        claimed = 0
+
+        for candidate in candidates_list or []:
+            name = candidate.get('name') or ''
+            if not name:
+                continue
+            if name in self.checkpoint_data.get('downloaded_application_data', []):
+                continue  # already counted in main pass
+            slug = self._candidate_name_slug(name)
+            if not slug:
+                continue
+
+            matches = (
+                list(job_folder.glob(f"{slug}-original-application.HTML"))
+                + list(job_folder.glob(f"{slug}-original-application.html"))
+                + list(job_folder.glob(f"{slug}*.HTML"))
+                + list(job_folder.glob(f"{slug}*.html"))
+            )
+            if not matches:
+                continue
+
+            candidate_folder = self._create_candidate_folder(name)
+            html_target = candidate_folder / "application.html"
+
+            for f in matches:
+                if not (f.is_file() and f.stat().st_size > 0):
+                    continue
+                try:
+                    if html_target.exists():
+                        html_target.unlink()
+                    f.rename(html_target)
+                    self._save_checkpoint(name=name, app_data=True)
+                    self.stats['app_data_downloaded'] += 1
+                    claimed += 1
+                    if self.log:
+                        self.log.event('app_data_late_claim', {
+                            'candidate': name,
+                            'slug': slug,
+                            'source': str(f.name),
+                        })
+                    break  # one file per candidate
+                except OSError as e:
+                    if self.log:
+                        self.log.event('app_data_late_claim_failed', {
+                            'candidate': name,
+                            'err': repr(e),
+                        })
+
+        return claimed
 
     def _fetch_application_json_via_page(self, candidate_folder: Path) -> bool:
         """Best-effort fetch of the candidate's screener Q&A JSON from
@@ -2802,15 +2967,39 @@ class IndeedDownloader:
                 self.log.event('app_data_json_fetch_skip', {'reason': 'url_read_failed', 'err': repr(e)})
             return False
 
+        # Get a CSRF token. Cache it the first time we discover one — the
+        # token is session-scoped and stable for the whole run, so we don't
+        # need to re-discover per candidate (saves a Chrome perf-log scan
+        # every iteration). Source priority:
+        #   1. Cached value from a prior iteration in this run.
+        #   2. Chrome's performance log — Indeed fires the iq/job/answers
+        #      URL itself during the modal flow, with the token in the
+        #      query string. Captured passively.
+        #   3. Page DOM (meta / cookie / inline HTML) — Indeed used to
+        #      expose the token there in older builds; kept as fallback.
+        # If all three fail, fetch without the token. Indeed will return
+        # 403, the JSON is skipped, HTML still ships, helper still succeeds.
+        csrf_token = getattr(self, '_indeed_csrf_token', None)
+        if not csrf_token:
+            csrf_token = self._discover_csrf_from_perflog()
+            if csrf_token:
+                self._indeed_csrf_token = csrf_token
+                if self.log:
+                    self.log.event('csrf_token_discovered', {'source': 'perflog'})
+
         js = r"""
         const callback = arguments[arguments.length - 1];
         const candidateId = arguments[0];
+        const cachedCsrf = arguments[1];
 
-        // Discover indeedcsrftoken from the page. Indeed exposes it in
-        // at least one of: meta tag, cookie, or inline scripts/HTML.
-        let csrf = null;
-        const meta = document.querySelector('meta[name="indeedcsrftoken"], meta[name="csrf-token"]');
-        if (meta) csrf = meta.getAttribute('content') || meta.getAttribute('value');
+        // Prefer the token Python passed in (discovered from perflog or
+        // cached from a prior iteration). Fall back to page-DOM scrape if
+        // Python didn't have one.
+        let csrf = cachedCsrf || null;
+        if (!csrf) {
+            const meta = document.querySelector('meta[name="indeedcsrftoken"], meta[name="csrf-token"]');
+            if (meta) csrf = meta.getAttribute('content') || meta.getAttribute('value');
+        }
         if (!csrf) {
             const m = document.cookie.match(/(?:^|;\s*)(?:indeedcsrftoken|CSRF|csrf)=([^;]+)/i);
             if (m) csrf = decodeURIComponent(m[1]);
@@ -2847,7 +3036,7 @@ class IndeedDownloader:
         for attempt in range(1, max_attempts + 1):
             try:
                 self.driver.set_script_timeout(15)
-                result = self.driver.execute_async_script(js, candidate_id)
+                result = self.driver.execute_async_script(js, candidate_id, csrf_token)
             except Exception as e:
                 if self.log:
                     self.log.event('app_data_json_fetch_error',
