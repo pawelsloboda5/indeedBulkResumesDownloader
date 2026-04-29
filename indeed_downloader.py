@@ -35,7 +35,7 @@ load_dotenv('.env.config')
 
 # Bumped whenever the binary layout changes. Shown in log headers so bug
 # reports are pinned to a known build.
-TOOL_VERSION = "2026-04-29-app-data-aggressive-diagnostics"
+TOOL_VERSION = "2026-04-29-app-data-html-plus-json-api"
 
 
 class RunLogger:
@@ -2669,17 +2669,17 @@ class IndeedDownloader:
                     pass
                 return False
 
-            # Tick HTML + JSON; skip PDF (already downloaded as the resume).
-            # Checked separately so failure is attributable to one or the other.
+            # Tick the HTML row only. The JSON checkbox in Indeed's modal
+            # is broken/cosmetic as of 2026-04-29 — ticking it does NOT
+            # trigger a Chrome download (verified via
+            # app_data_download_locations_snapshot in
+            # logs/run_20260429_145657.log: HTML file lands but no
+            # `cao_post_body_*.json` exists anywhere on disk). The same
+            # data is still served by Indeed's iq/job/answers API which we
+            # call directly after HTML lands. Skip PDF (= the resume,
+            # already downloaded by the CV pass).
             if not self._check_app_data_box(r'-original-application\.html|original-application', modal):
                 self._last_helper_failure_step = 'checkbox_html'
-                try:
-                    self.driver.execute_script("document.body.click();")
-                except Exception:
-                    pass
-                return False
-            if not self._check_app_data_box(r'cao_post_body', modal):
-                self._last_helper_failure_step = 'checkbox_json'
                 try:
                     self.driver.execute_script("document.body.click();")
                 except Exception:
@@ -2699,6 +2699,15 @@ class IndeedDownloader:
             if not self._move_application_files(name, candidate_folder):
                 self._last_helper_failure_step = 'files'
                 return False
+
+            # HTML landed. Now fetch the screener Q&A JSON via Indeed's
+            # iq/job/answers endpoint — discovered from passive URL capture
+            # (logs/app_data_urls.json). This runs in the page context so
+            # the existing session cookies and CSRF token are reused
+            # automatically. Best-effort: failure is logged but doesn't
+            # block overall success since the HTML file already contains
+            # the same Q&A data in human-readable form.
+            self._fetch_application_json_via_page(candidate_folder)
             return True
 
         except Exception:
@@ -2710,17 +2719,22 @@ class IndeedDownloader:
             return False
 
     def _move_application_files(self, name: str, candidate_folder: Path) -> bool:
-        """Wait for Chrome to drop the two app-data files in the job folder,
-        then move + rename them into the candidate folder as
-        application.html and application.json. Returns True iff BOTH arrived.
+        """Wait for Chrome to drop the HTML application file in the job
+        folder, then move + rename it into the candidate folder as
+        application.html. Returns True iff the HTML arrived within ~15s.
 
-        Snapshots the set of matching files already present in the job folder
-        at call time (e.g., stragglers from a previous candidate whose download
-        was still streaming) so we don't misattribute them to this candidate.
+        Snapshots pre-existing matching files at call time so stragglers
+        from a previous candidate's still-streaming download don't get
+        misattributed to this candidate.
+
+        JSON note: the modal's "raw JSON" checkbox no longer triggers a
+        Chrome download as of 2026-04-29 (Indeed UI change — verified in
+        logs/run_20260429_145657.log). JSON is fetched separately in
+        _fetch_application_json_via_page() via Indeed's iq/job/answers
+        endpoint, after this helper returns.
         """
         job_folder = self.current_job_folder or Path(self.download_folder)
         html_target = candidate_folder / "application.html"
-        json_target = candidate_folder / "application.json"
 
         def _find_html_matches():
             return (
@@ -2729,18 +2743,8 @@ class IndeedDownloader:
                 + list(job_folder.glob("*.HTML"))
             )
 
-        def _find_json_matches():
-            return (
-                list(job_folder.glob("cao_post_body_*.json"))
-                + list(job_folder.glob("cao_post_body*.json"))
-            )
-
-        # Snapshot pre-existing matching files to exclude them from "just arrived".
         pre_existing_html = set(_find_html_matches())
-        pre_existing_json = set(_find_json_matches())
-
         html_found = html_target.exists()
-        json_found = json_target.exists()
 
         for _ in range(30):  # up to ~15s
             if not html_found:
@@ -2757,25 +2761,113 @@ class IndeedDownloader:
                         except OSError:
                             pass
 
-            if not json_found:
-                for f in _find_json_matches():
-                    if f in pre_existing_json:
-                        continue
-                    if f.is_file() and f.stat().st_size > 0:
-                        try:
-                            if json_target.exists():
-                                json_target.unlink()
-                            f.rename(json_target)
-                            json_found = True
-                            break
-                        except OSError:
-                            pass
-
-            if html_found and json_found:
+            if html_found:
                 return True
             time.sleep(0.5)
 
-        return html_found and json_found
+        return html_found
+
+    def _fetch_application_json_via_page(self, candidate_folder: Path) -> bool:
+        """Best-effort fetch of the candidate's screener Q&A JSON from
+        Indeed's iq/job/answers endpoint, executed via fetch() inside
+        the candidate's profile page (so cookies + CSRF are inherited).
+
+        Endpoint discovered from passive URL capture in
+        logs/app_data_urls.json:
+            GET /api/v2/iq/job/answers
+                ?indeedcsrftoken=<tok>
+                &indeedClientApplication=candidate-qualifications
+                &candidateIds=<legacy_id>
+
+        legacy_id is read from the current page URL (?id=<legacy_id>).
+        CSRF token is discovered by trying meta tag, cookie, and inline
+        HTML scrape — Indeed exposes it in at least one of these.
+
+        Returns True iff JSON saved to candidate_folder/application.json.
+        Caller should NOT block on the result — HTML alone contains the
+        same data in human-readable form, so we treat the JSON as a
+        bonus, not a requirement. All outcomes are logged for triage.
+        """
+        try:
+            current_url = self.driver.current_url or ''
+            m = re.search(r'[?&]id=([^&]+)', current_url)
+            if not m:
+                if self.log:
+                    self.log.event('app_data_json_fetch_skip',
+                                   {'reason': 'no_id_in_url', 'url': current_url[:200]})
+                return False
+            candidate_id = m.group(1)
+        except Exception as e:
+            if self.log:
+                self.log.event('app_data_json_fetch_skip', {'reason': 'url_read_failed', 'err': repr(e)})
+            return False
+
+        js = r"""
+        const callback = arguments[arguments.length - 1];
+        const candidateId = arguments[0];
+
+        // Discover indeedcsrftoken from the page. Indeed exposes it in
+        // at least one of: meta tag, cookie, or inline scripts/HTML.
+        let csrf = null;
+        const meta = document.querySelector('meta[name="indeedcsrftoken"], meta[name="csrf-token"]');
+        if (meta) csrf = meta.getAttribute('content') || meta.getAttribute('value');
+        if (!csrf) {
+            const m = document.cookie.match(/(?:^|;\s*)(?:indeedcsrftoken|CSRF|csrf)=([^;]+)/i);
+            if (m) csrf = decodeURIComponent(m[1]);
+        }
+        if (!csrf) {
+            const html = document.documentElement.outerHTML.slice(0, 800000);
+            const m = html.match(/indeedcsrftoken["'=:\s]+([a-f0-9]{16,})/i);
+            if (m) csrf = m[1];
+        }
+
+        let url = '/api/v2/iq/job/answers'
+                + '?indeedClientApplication=candidate-qualifications'
+                + '&candidateIds=' + encodeURIComponent(candidateId);
+        if (csrf) url += '&indeedcsrftoken=' + encodeURIComponent(csrf);
+
+        fetch(url, {credentials: 'include', headers: {'Accept': 'application/json'}})
+            .then(r => r.ok
+                ? r.json().then(data => callback({ok: true, csrf_found: !!csrf, status: r.status, data}))
+                : callback({ok: false, csrf_found: !!csrf, status: r.status, err: 'HTTP ' + r.status}))
+            .catch(err => callback({ok: false, csrf_found: !!csrf, err: String(err)}));
+        """
+
+        try:
+            self.driver.set_script_timeout(15)
+            result = self.driver.execute_async_script(js, candidate_id)
+        except Exception as e:
+            if self.log:
+                self.log.event('app_data_json_fetch_error',
+                               {'err': repr(e), 'candidate_id': candidate_id})
+            return False
+
+        if not result or not result.get('ok'):
+            if self.log:
+                self.log.event('app_data_json_fetch_failed', {
+                    'candidate_id': candidate_id,
+                    'csrf_found': result.get('csrf_found') if result else None,
+                    'status': result.get('status') if result else None,
+                    'err': result.get('err') if result else 'no_result',
+                })
+            return False
+
+        json_target = candidate_folder / "application.json"
+        try:
+            with open(json_target, 'w', encoding='utf-8') as f:
+                json.dump(result.get('data'), f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            if self.log:
+                self.log.event('app_data_json_save_failed',
+                               {'err': repr(e), 'candidate_id': candidate_id})
+            return False
+
+        if self.log:
+            self.log.event('app_data_json_saved', {
+                'candidate_id': candidate_id,
+                'csrf_found': result.get('csrf_found'),
+            })
+        return True
 
     def _go_to_next_candidate(self) -> bool:
         """Navigate to next candidate"""
