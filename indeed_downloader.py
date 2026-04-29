@@ -35,7 +35,7 @@ load_dotenv('.env.config')
 
 # Bumped whenever the binary layout changes. Shown in log headers so bug
 # reports are pinned to a known build.
-TOOL_VERSION = "2026-04-29-app-data-html-plus-json-api"
+TOOL_VERSION = "2026-04-29-app-data-json-api-with-429-backoff"
 
 
 class RunLogger:
@@ -2833,14 +2833,45 @@ class IndeedDownloader:
             .catch(err => callback({ok: false, csrf_found: !!csrf, err: String(err)}));
         """
 
-        try:
-            self.driver.set_script_timeout(15)
-            result = self.driver.execute_async_script(js, candidate_id)
-        except Exception as e:
-            if self.log:
-                self.log.event('app_data_json_fetch_error',
-                               {'err': repr(e), 'candidate_id': candidate_id})
-            return False
+        # 429 backoff loop. Indeed has been gentle to the resume CV path
+        # at this cadence (~3-7 candidates/min for app-data, even more
+        # conservative than CV's ~18/min), but if Indeed ever does push
+        # back this turns "silent failure on this candidate" into "wait
+        # and retry, succeed on attempt 2-3". Exponential backoff
+        # 1s → 2s → 4s, capped at 8s. Only retries on 429; non-rate
+        # failures (auth, 404, network) bail immediately since retry
+        # won't change them.
+        max_attempts = 3
+        backoff_s = 1.0
+        result = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                self.driver.set_script_timeout(15)
+                result = self.driver.execute_async_script(js, candidate_id)
+            except Exception as e:
+                if self.log:
+                    self.log.event('app_data_json_fetch_error',
+                                   {'err': repr(e), 'candidate_id': candidate_id,
+                                    'attempt': attempt})
+                return False
+
+            if result and result.get('ok'):
+                break
+
+            status = result.get('status') if result else None
+            if status == 429 and attempt < max_attempts:
+                if self.log:
+                    self.log.event('app_data_json_rate_limit_backoff', {
+                        'candidate_id': candidate_id,
+                        'attempt': attempt,
+                        'backoff_s': backoff_s,
+                    })
+                time.sleep(backoff_s)
+                backoff_s = min(backoff_s * 2, 8.0)
+                continue
+
+            # Non-429 failure (auth, 404, network) — retry won't help.
+            break
 
         if not result or not result.get('ok'):
             if self.log:
@@ -2849,6 +2880,7 @@ class IndeedDownloader:
                     'csrf_found': result.get('csrf_found') if result else None,
                     'status': result.get('status') if result else None,
                     'err': result.get('err') if result else 'no_result',
+                    'attempts': attempt,
                 })
             return False
 
