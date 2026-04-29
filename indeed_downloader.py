@@ -36,7 +36,7 @@ load_dotenv('.env.config')
 
 # Bumped whenever the binary layout changes. Shown in log headers so bug
 # reports are pinned to a known build.
-TOOL_VERSION = "2026-04-29-csrf-from-perflog-plus-late-claim"
+TOOL_VERSION = "2026-04-29-all-jobs-legacy-id-capture"
 
 
 class RunLogger:
@@ -3240,19 +3240,30 @@ class IndeedDownloader:
                     except NoSuchElementException:
                         pass
 
-                    # Extract the employerJobId from the link
-                    employer_job_id = None
+                    # Extract BOTH id forms from the link. Indeed embeds
+                    # the long IRI form (`employerJobId=` for GraphQL queries)
+                    # and the short base64 form (`id=` for /candidates/view
+                    # profile URLs as legacyJobId) in the same job-link URL.
+                    # The single-job path reads the short form from the URL
+                    # bar; in all-jobs mode the URL bar is the /jobs table,
+                    # so we have to harvest both params here. If the short
+                    # form is missing, the app-data pass falls back to a
+                    # legacyJobId-less profile URL and Indeed may hide the
+                    # "Download application data" menu — silent failure.
+                    employer_job_id = None  # IRI form, used by GraphQL
+                    short_id = None         # base64 short form, used by app-data
                     if job_link:
-                        # Try employerJobId first
-                        if 'employerJobId=' in job_link:
-                            match = re.search(r'employerJobId=([^&]+)', job_link)
-                            if match:
-                                employer_job_id = unquote(match.group(1))
-                        # Try id parameter
-                        elif 'id=' in job_link:
-                            match = re.search(r'[?&]id=([^&]+)', job_link)
-                            if match:
-                                employer_job_id = unquote(match.group(1))
+                        iri_match = re.search(r'employerJobId=([^&]+)', job_link)
+                        if iri_match:
+                            employer_job_id = unquote(iri_match.group(1))
+                        short_match = re.search(r'[?&]id=([^&]+)', job_link)
+                        if short_match:
+                            short_id = unquote(short_match.group(1))
+                        # Fallback for jobs that only expose `id=`: treat the
+                        # short form as the GraphQL identifier too. Preserves
+                        # prior behavior for jobs without an `employerJobId=`.
+                        if not employer_job_id and short_id:
+                            employer_job_id = short_id
 
                     has_valid_api_id = bool(employer_job_id)
 
@@ -3264,6 +3275,7 @@ class IndeedDownloader:
 
                     jobs.append({
                         'id': employer_job_id,
+                        'short_id': short_id,
                         'has_valid_api_id': has_valid_api_id,
                         'title': title,
                         'title_clean': clean_title,
@@ -3713,6 +3725,12 @@ class IndeedDownloader:
 
             self.current_job_id = job['id']
             self.current_job_name = job['title']
+            # Reset before each job; harvested from job-link URL above.
+            # Single-job path sets this from the URL bar; all-jobs path
+            # gets it from the /jobs table extraction. Without it, the
+            # app-data pass falls back to /candidates/view?id=<X> which
+            # may not surface the "Download application data" menu.
+            self.current_job_legacy_id = job.get('short_id')
             self._create_job_folder(job['title'], job['date'])
 
             if self.mode == 'backend':
