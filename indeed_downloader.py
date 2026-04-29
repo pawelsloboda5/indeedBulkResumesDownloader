@@ -35,7 +35,7 @@ load_dotenv('.env.config')
 
 # Bumped whenever the binary layout changes. Shown in log headers so bug
 # reports are pinned to a known build.
-TOOL_VERSION = "2026-04-23-app-data-correct-profile-url"
+TOOL_VERSION = "2026-04-29-app-data-download-path-fix"
 
 
 class RunLogger:
@@ -742,6 +742,15 @@ class IndeedDownloader:
             return False
 
         self.wait = WebDriverWait(self.driver, 30)
+
+        # Attach mode never sees Chrome's launch-time `prefs`, so the
+        # user's regular profile owns the download path (typically
+        # ~/Downloads). Override it before any per-job folder is set so
+        # any straggler download lands in our global folder, not the
+        # user's Documents/Downloads. _create_job_folder will narrow it
+        # further to the per-job folder once the job is selected.
+        self._point_chrome_downloads_at(Path(self.download_folder))
+
         print(f"✅ Attached to Chrome at 127.0.0.1:{self._chrome_debug_port}")
         return True
 
@@ -1166,7 +1175,37 @@ class IndeedDownloader:
         job_folder.mkdir(exist_ok=True)
 
         self.current_job_folder = job_folder
+        self._point_chrome_downloads_at(job_folder)
         return job_folder
+
+    def _point_chrome_downloads_at(self, folder: Path) -> None:
+        """Repoint Chrome's download directory at `folder` via CDP.
+
+        Why CDP instead of Chrome `prefs`: the prefs path is set once at
+        Chrome launch, can't be changed afterwards, and isn't honored at all
+        in attach mode (the user's pre-existing Chrome profile owns the
+        download path there). Page.setDownloadBehavior overrides at runtime
+        and works identically in auto and attach mode.
+
+        Without this, the app-data modal flow's "Download files" click drops
+        files into Chrome's default location (e.g., C:\\Users\\<user>\\Downloads
+        in attach mode), but `_move_application_files` looks in
+        `current_job_folder` — so they never get matched and `step: "files"`
+        always fails. See logs/run_20260429_141424.log for the 5/5 failure
+        that motivated this fix.
+        """
+        if self.driver is None:
+            return
+        try:
+            self.driver.execute_cdp_cmd(
+                'Page.setDownloadBehavior',
+                {'behavior': 'allow', 'downloadPath': str(folder.absolute())},
+            )
+            if self.log:
+                self.log.event('chrome_download_path_set', {'path': str(folder.absolute())})
+        except Exception as e:
+            if self.log:
+                self.log.event('chrome_download_path_failed', {'err': repr(e)})
 
     def _close_modals(self):
         """Close any modal/popup that might be open"""
