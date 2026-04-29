@@ -36,7 +36,7 @@ load_dotenv('.env.config')
 
 # Bumped whenever the binary layout changes. Shown in log headers so bug
 # reports are pinned to a known build.
-TOOL_VERSION = "2026-04-29-all-jobs-legacy-id-capture"
+TOOL_VERSION = "2026-04-29-all-jobs-legacy-id-plus-logging"
 
 
 class RunLogger:
@@ -3696,6 +3696,8 @@ class IndeedDownloader:
 
         if not jobs:
             print("No jobs found")
+            if self.log:
+                self.log.event('all_jobs_no_jobs_found', {})
             return
 
         # Filter out jobs older than 2 years (Indeed archives data)
@@ -3703,6 +3705,8 @@ class IndeedDownloader:
 
         if not jobs:
             print("No recent jobs to process (all > 2 years)")
+            if self.log:
+                self.log.event('all_jobs_all_filtered_old', {})
             return
 
         # Check for existing folders (compare by name, not checkpoint)
@@ -3713,10 +3717,43 @@ class IndeedDownloader:
 
         if not jobs:
             print("No jobs to process!")
+            if self.log:
+                self.log.event('all_jobs_all_skipped_existing', {})
             return
 
         print(f"\n{len(jobs)} jobs to process")
         print("=" * 60)
+
+        # Run-level event so we know the planned scope. job_summary is a
+        # truncated list (id + short_id + title + status + candidate count
+        # only) so we can correlate per-job events with the planned set
+        # without dumping job_link or other PII-adjacent fields.
+        if self.log:
+            self.log.event('all_jobs_run_start', {
+                'total_jobs': len(jobs),
+                'mode': self.mode,
+                'job_statuses_filter': sorted(self.job_statuses),
+                'download_app_data': self.download_app_data,
+                'job_summary': [
+                    {
+                        'index': i,
+                        'id_present': bool(job.get('id')),
+                        'short_id_present': bool(job.get('short_id')),
+                        'has_valid_api_id': job.get('has_valid_api_id', False),
+                        'status': job.get('status'),
+                        'date': job.get('date'),
+                        'total_candidates': job.get('total_candidates', 0),
+                        'title_truncated': (job.get('title_clean') or job.get('title') or '')[:80],
+                    }
+                    for i, job in enumerate(jobs)
+                ],
+            })
+
+        # Aggregate counters for the run summary at the end.
+        run_started_at = time.time()
+        jobs_completed = 0
+        jobs_skipped_archived = 0
+        jobs_errored = 0
 
         for i, job in enumerate(jobs):
             title_display = job.get('title_clean', job['title'])
@@ -3731,29 +3768,109 @@ class IndeedDownloader:
             # app-data pass falls back to /candidates/view?id=<X> which
             # may not surface the "Download application data" menu.
             self.current_job_legacy_id = job.get('short_id')
-            self._create_job_folder(job['title'], job['date'])
 
-            if self.mode == 'backend':
-                # Synthetic IDs (title + date) cannot be passed to the GraphQL
-                # API as employerJobId — Indeed returns empty results silently.
-                # Skip the job so the user can fall back to Frontend mode for it.
-                if not job.get('has_valid_api_id', True):
-                    print(f"   ⚠ Skipping — no Indeed employerJobId on the jobs-table link. Use Frontend mode for this job.")
-                    self.stats['archived'] += 1
-                    continue
-                # Close any modals that might appear
-                self._close_modals()
-                self._download_all_candidates_api(job.get('total_candidates', 0))
-            else:
-                # Navigate to job
-                self.driver.get(f"https://employers.indeed.com/candidates?selectedJobs={job['id']}")
-                time.sleep(3)
-                # Close any modals that might appear
-                self._close_modals()
-                self._download_all_candidates_frontend()
+            # Snapshot global stats so we can derive a per-job delta in
+            # all_jobs_job_done. Without this, a failed job is invisible
+            # in the log unless the deeper helpers happen to log — and
+            # downloaded/app_data_downloaded only show the run total.
+            stats_before = {
+                'downloaded': self.stats.get('downloaded', 0),
+                'failed': self.stats.get('failed', 0),
+                'skipped': self.stats.get('skipped', 0),
+                'app_data_downloaded': self.stats.get('app_data_downloaded', 0),
+                'archived': self.stats.get('archived', 0),
+            }
+            job_started_at = time.time()
+            if self.log:
+                self.log.event('all_jobs_job_start', {
+                    'index': i,
+                    'total': len(jobs),
+                    'job_id': job.get('id'),
+                    'short_id': job.get('short_id'),
+                    'has_valid_api_id': job.get('has_valid_api_id', False),
+                    'title_truncated': title_display[:80],
+                    'status': job.get('status'),
+                    'date': job.get('date'),
+                    'total_candidates': job.get('total_candidates', 0),
+                })
 
-            self._save_checkpoint(job_id=job['id'])
-            print(f"   Job finished: {title_display}")
+            try:
+                self._create_job_folder(job['title'], job['date'])
+
+                if self.mode == 'backend':
+                    # Synthetic IDs (title + date) cannot be passed to the GraphQL
+                    # API as employerJobId — Indeed returns empty results silently.
+                    # Skip the job so the user can fall back to Frontend mode for it.
+                    if not job.get('has_valid_api_id', True):
+                        print(f"   ⚠ Skipping — no Indeed employerJobId on the jobs-table link. Use Frontend mode for this job.")
+                        self.stats['archived'] += 1
+                        jobs_skipped_archived += 1
+                        if self.log:
+                            self.log.event('all_jobs_job_skipped', {
+                                'index': i,
+                                'reason': 'no_valid_api_id',
+                                'title_truncated': title_display[:80],
+                            })
+                        continue
+                    # Close any modals that might appear
+                    self._close_modals()
+                    self._download_all_candidates_api(job.get('total_candidates', 0))
+                else:
+                    # Navigate to job
+                    self.driver.get(f"https://employers.indeed.com/candidates?selectedJobs={job['id']}")
+                    time.sleep(3)
+                    # Close any modals that might appear
+                    self._close_modals()
+                    self._download_all_candidates_frontend()
+
+                self._save_checkpoint(job_id=job['id'])
+                print(f"   Job finished: {title_display}")
+                jobs_completed += 1
+
+                if self.log:
+                    self.log.event('all_jobs_job_done', {
+                        'index': i,
+                        'job_id': job.get('id'),
+                        'title_truncated': title_display[:80],
+                        'duration_s': round(time.time() - job_started_at, 1),
+                        'delta_downloaded': self.stats.get('downloaded', 0) - stats_before['downloaded'],
+                        'delta_failed': self.stats.get('failed', 0) - stats_before['failed'],
+                        'delta_skipped': self.stats.get('skipped', 0) - stats_before['skipped'],
+                        'delta_app_data_downloaded': self.stats.get('app_data_downloaded', 0) - stats_before['app_data_downloaded'],
+                    })
+
+            except Exception as e:
+                # A single job's failure must not kill the whole all-jobs
+                # run. Log full context and move to the next job — HR can
+                # rerun the failed job individually later by name. This
+                # mirrors the resume-friendly philosophy of the rest of
+                # the tool (every CV is checkpointed; every job here is too).
+                jobs_errored += 1
+                err_msg = repr(e)
+                print(f"   ❌ Job errored, continuing: {err_msg[:200]}")
+                if self.log:
+                    import traceback
+                    self.log.event('all_jobs_job_error', {
+                        'index': i,
+                        'job_id': job.get('id'),
+                        'short_id': job.get('short_id'),
+                        'title_truncated': title_display[:80],
+                        'duration_s': round(time.time() - job_started_at, 1),
+                        'error': err_msg[:500],
+                        'traceback_tail': traceback.format_exc()[-1000:],
+                    })
+
+        if self.log:
+            self.log.event('all_jobs_run_summary', {
+                'total_jobs': len(jobs),
+                'jobs_completed': jobs_completed,
+                'jobs_skipped_archived': jobs_skipped_archived,
+                'jobs_errored': jobs_errored,
+                'duration_s': round(time.time() - run_started_at, 1),
+                'final_downloaded': self.stats.get('downloaded', 0),
+                'final_failed': self.stats.get('failed', 0),
+                'final_app_data_downloaded': self.stats.get('app_data_downloaded', 0),
+            })
 
     # ==================== MAIN ====================
 
