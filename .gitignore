@@ -71,3 +71,9 @@ chromedriver
 
 # DevTools network captures from HR — contain bearer tokens + session cookies
 indeed_graphql_*.txt
+
+# Live Indeed session token — treat like a password (see HR_GUIDE.md security checklist)
+indeed_cookies.json
+
+# Subagent-driven-development scratch workspace
+.superpowers/
