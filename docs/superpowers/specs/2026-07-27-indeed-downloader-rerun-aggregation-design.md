@@ -155,7 +155,7 @@ Always re-checking every job costs one API pass per job (seconds, since no PDFs 
 
 `indeed_downloader.py` keeps the browser and API work. This split is what makes the identity logic testable without a browser, and it is the only structural change. No unrelated refactoring.
 
-Check `.github/workflows/build-exe.yml` picks up the new module in the PyInstaller build.
+The build needs no change. `.github/workflows/build-exe.yml` runs `pyinstaller --onefile ... indeed_downloader.py`, and PyInstaller's Analysis pass follows ordinary static imports on its own. `--paths` and `--hidden-import` are only required for imports it cannot see statically: `__import__` with a computed name, `importlib.import_module`, `exec`/`eval`, or a script that manipulates `sys.path`. So `import manifest` at the top of `indeed_downloader.py`, with `manifest.py` beside it, is bundled automatically. Do not import it dynamically, or the .exe will raise `ModuleNotFoundError` at runtime while working fine from source.
 
 ## Error handling
 
@@ -168,6 +168,10 @@ Check `.github/workflows/build-exe.yml` picks up the new module in the PyInstall
 ## Testing
 
 The repo has no tests today. Add `tests/test_manifest.py` using pytest against `manifest.py`. No browser, no network.
+
+pytest is not in `requirements.txt` and should not go there, since that file feeds the PyInstaller build and would bloat the .exe. Add `requirements-dev.txt` with a pinned `pytest`, matching the pinning style of the runtime deps.
+
+Tests build their fixtures with the `tmp_path` fixture, which hands each test function its own `pathlib.Path` directory, and `monkeypatch` where a stub is needed. `monkeypatch` undoes every change at teardown automatically, so no test needs its own cleanup.
 
 1. Backfill from a fake folder tree produces correct entries, with `has_cv` matching `resume.pdf` presence.
 2. Promotion: a `_backfill:jane smith` entry plus an API result carrying a legacy ID rewrites the key and preserves `folder`.
