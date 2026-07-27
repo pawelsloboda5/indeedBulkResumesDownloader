@@ -641,3 +641,18 @@ def test_manifest_is_untouched_by_an_aborted_run(tmp_path):
         manifest.save(tmp_path, m)
 
     assert (tmp_path / "manifest.json").read_bytes() == before
+
+
+def test_app_data_lands_in_the_same_folder_as_the_resume(tmp_path):
+    """Guards the four-caller convergence _candidate_folder_for exists for."""
+    m = manifest.new_manifest({})
+    cv_key = manifest.entry_key(_api("John Smith", "abc123"))
+    cv_folder = manifest.allocate_candidate_folder(tmp_path, m, cv_key, "John Smith")
+    manifest.record(m, cv_key, "John Smith", cv_folder.name, True, "2026-07-27")
+
+    later_key = (manifest.find_key_by_name(m, "John Smith")
+                 or manifest.NOKEY_PREFIX + manifest.normalize_name("John Smith"))
+    later_folder = manifest.allocate_candidate_folder(tmp_path, m, later_key, "John Smith")
+
+    assert later_folder == cv_folder
+    assert len([p for p in tmp_path.iterdir() if p.is_dir()]) == 1

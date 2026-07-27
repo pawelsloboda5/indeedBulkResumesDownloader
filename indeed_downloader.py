@@ -1624,79 +1624,23 @@ class IndeedDownloader:
             job_name = fallback
 
         try:
-            self._create_job_folder(job_name)
+            # No posting date is available on the candidates page. That is
+            # fine: the manifest carries the job id, so a later all-jobs run
+            # resolves to this same folder even though it would have named a
+            # new one "<title> (DD-MM-YYYY)".
+            self._create_job_folder(
+                job_name, None,
+                employer_job_id=self.current_job_id,
+                short_id=self.current_job_legacy_id,
+            )
             print(f"📁 Folder: {self.current_job_folder}")
-        except Exception:
-            pass
-
-        self._download_all_candidates_api()
-
-    def _load_job_checkpoint(self, scan_pdfs: bool = False) -> tuple:
-        """Load checkpoint for current job folder - returns (downloaded_ids, downloaded_names)
-
-        Args:
-            scan_pdfs: If True, scan existing PDF files for names (for existing jobs with new candidates)
-        """
-        downloaded_ids = set(self.checkpoint_data.get('downloaded_ids', []))
-        downloaded_names = set(self.checkpoint_data.get('downloaded_names', []))
-
-        if not self.current_job_folder:
-            return downloaded_ids, downloaded_names
-
-        # Load from job-specific checkpoint if exists
-        job_checkpoint_file = self.current_job_folder / 'checkpoint.json'
-        if job_checkpoint_file.exists():
-            try:
-                with open(job_checkpoint_file, 'r', encoding='utf-8') as f:
-                    job_data = json.load(f)
-                    downloaded_ids.update(job_data.get('downloaded_ids', []))
-                    downloaded_names.update(job_data.get('downloaded_names', []))
-            except (json.JSONDecodeError, IOError):
-                pass
-
-        # Scan existing PDF files to get names (only for existing jobs with new candidates)
-        if scan_pdfs:
-            print("   Scanning existing CVs...")
-            for pdf_file in self.current_job_folder.rglob('*.pdf'):
-                # Format: "Jean Dupont_20251126_154317.pdf"
-                name_part = pdf_file.stem.rsplit('_', 2)[0]  # Get "Jean Dupont"
-                if name_part:
-                    downloaded_names.add(name_part.lower())
-            print(f"   {len(downloaded_names)} names found in existing files")
-
-        return downloaded_ids, downloaded_names
-
-    def _save_job_checkpoint(self, legacy_id: str, name: str = None):
-        """Save checkpoint for current job folder"""
-        if not self.current_job_folder:
+        except Exception as e:
+            print(f"❌ Could not prepare the job folder: {e!r}")
+            if self.log:
+                self.log.event('single_job_folder_failed', {'err': repr(e)})
             return
 
-        job_checkpoint_file = self.current_job_folder / 'checkpoint.json'
-
-        # Load existing
-        job_data = {'downloaded_ids': [], 'downloaded_names': []}
-        if job_checkpoint_file.exists():
-            try:
-                with open(job_checkpoint_file, 'r', encoding='utf-8') as f:
-                    job_data = json.load(f)
-                    if 'downloaded_names' not in job_data:
-                        job_data['downloaded_names'] = []
-            except (json.JSONDecodeError, IOError):
-                pass
-
-        # Add new id
-        if legacy_id and legacy_id not in job_data['downloaded_ids']:
-            job_data['downloaded_ids'].append(legacy_id)
-
-        # Add new name
-        if name:
-            clean_name = "".join(c for c in name if c.isalnum() or c in (' ', '-', '_')).strip().lower()
-            if clean_name and clean_name not in job_data['downloaded_names']:
-                job_data['downloaded_names'].append(clean_name)
-
-        # Save
-        with open(job_checkpoint_file, 'w', encoding='utf-8') as f:
-            json.dump(job_data, f, ensure_ascii=False, indent=2)
+        self._download_all_candidates_api()
 
     def _fetch_candidates_batch(self, dispositions: list, sort_by: str = "APPLY_DATE", sort_order: str = "DESCENDING") -> tuple:
         """Fetch candidates with specific filters, returns (candidates_list, total_count)"""
@@ -1763,8 +1707,11 @@ class IndeedDownloader:
         })
         manifest_mod.save(self.current_job_folder, self.current_manifest)
         manifest_mod.write_no_cv(self.current_job_folder, self.current_manifest)
-        # stats.json stays for backward compatibility with older reports.
-        # Nothing reads it for a decision any more.
+        # stats.json stays for the end-of-run report, which reads only
+        # total_announced and total_recovered (see _generate_report). The
+        # `processed` value is the cumulative manifest size — it counts stale
+        # and unmatched backfill entries, so it is NOT bounded by
+        # total_recovered and must never be compared against it.
         self._save_job_stats(total_announced, total_recovered,
                              len(self.current_manifest['candidates']))
 
@@ -2331,7 +2278,7 @@ class IndeedDownloader:
                     pbar.update(1)
                     continue
 
-                candidate_folder = self._create_candidate_folder(name)
+                candidate_folder = self._candidate_folder_for(name)
 
                 # Navigate to this candidate's profile-DETAIL view. `legacyJobId`
                 # carries the job context so the profile's kebab menu includes
@@ -2486,10 +2433,38 @@ class IndeedDownloader:
                            document.querySelector('h1');
                 return el ? el.textContent.trim() : 'Job';
             """)
-            self._create_job_folder(job_name)
+            # Frontend mode lands the user on a candidate page rather than the
+            # jobs table, so the URL shape is not guaranteed to carry either
+            # identifier. Harvest whatever is present and pass it through:
+            # with an id the manifest collapses this folder onto the same one
+            # the backend and all-jobs paths use; without one it still works,
+            # falling back to name-and-date resolution.
+            job_url = self.driver.current_url
+            employer_job_id = self._extract_job_id_from_url(job_url)
+            short_id = None
+            try:
+                params = parse_qs(urlparse(job_url).query)
+                candidate_short = params.get('legacyJobId', [None])[0] or params.get('id', [None])[0]
+                if candidate_short and candidate_short != '0':
+                    short_id = candidate_short
+            except (ValueError, KeyError, IndexError):
+                pass
+            self._create_job_folder(
+                job_name, None,
+                employer_job_id=employer_job_id,
+                short_id=short_id,
+            )
             print(f"📁 Folder: {self.current_job_folder}")
-        except Exception:
-            pass
+            if self.log:
+                self.log.event('frontend_single_job_ids', {
+                    'has_employer_job_id': bool(employer_job_id),
+                    'has_short_id': bool(short_id),
+                })
+        except Exception as e:
+            print(f"❌ Could not prepare the job folder: {e!r}")
+            if self.log:
+                self.log.event('frontend_single_job_folder_failed', {'err': repr(e)})
+            return
 
         self._download_all_candidates_frontend()
 
@@ -2513,7 +2488,7 @@ class IndeedDownloader:
 
             # Always compute the candidate folder — CV flow and app-data flow
             # both need it, and mkdir is idempotent.
-            candidate_folder = self._create_candidate_folder(name)
+            candidate_folder = self._candidate_folder_for(name)
 
             # Check if already downloaded (CV dedup)
             if name in self.checkpoint_data['downloaded_names']:
@@ -2630,21 +2605,6 @@ class IndeedDownloader:
         "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'download files')]",
         "//div[@role='dialog']//button[@type='submit']",
     ]
-
-    def _create_candidate_folder(self, name: str) -> Path:
-        """Return (and create) downloads/<job>/<safe candidate name>/.
-
-        Sanitization matches the other places that clean a candidate name:
-        keep alphanumerics, spaces, dashes, underscores; strip everything else.
-        Falls back to 'unknown' if the cleaned name ends up empty.
-        """
-        safe_name = "".join(c for c in name if c.isalnum() or c in (' ', '-', '_')).strip()
-        if not safe_name:
-            safe_name = "unknown"
-        base = self.current_job_folder or Path(self.download_folder)
-        folder = base / safe_name
-        folder.mkdir(parents=True, exist_ok=True)
-        return folder
 
     def _download_cv_frontend(self, name: str, candidate_folder: Path) -> bool:
         """Download CV using click, then move the PDF into candidate_folder."""
@@ -2992,7 +2952,7 @@ class IndeedDownloader:
             if not matches:
                 continue
 
-            candidate_folder = self._create_candidate_folder(name)
+            candidate_folder = self._candidate_folder_for(name)
             html_target = candidate_folder / "application.html"
 
             for f in matches:
@@ -3488,271 +3448,6 @@ class IndeedDownloader:
 
         return all_jobs
 
-    def _find_existing_job_folders(self, jobs: list) -> dict:
-        """Find which jobs already have folders in downloads
-
-        Returns dict mapping job_id -> folder info, ensuring each folder is matched to only one job.
-        Matching priority:
-        1. Exact name + exact date (score 4) - must match
-        2. Exact name only (score 2) - only if folder has no date or job has no date
-        3. Partial name + exact date (score 3)
-        4. Partial name only (score 1) - only if folder has no date or job has no date
-
-        IMPORTANT: If both job and folder have dates, they MUST match for name matching.
-        """
-        existing = {}
-        download_path = Path(self.download_folder)
-
-        if not download_path.exists():
-            return existing
-
-        # Normalize function for comparison (removes accents for comparison only)
-        def normalize(s):
-            import unicodedata
-            s = unicodedata.normalize('NFKD', s).encode('ASCII', 'ignore').decode('ASCII')
-            s = re.sub(r'[^a-z0-9\s]', '', s.lower())
-            s = re.sub(r'\s+', ' ', s).strip()
-            return s
-
-        # Get all folders with their info
-        folder_info = {}
-        for folder in download_path.iterdir():
-            if folder.is_dir():
-                # Format: "Nom du job (DD-MM-YYYY)"
-                match = re.match(r'(.+) \((\d{2}-\d{2}-\d{4})\)$', folder.name)
-                if match:
-                    job_name = match.group(1)
-                    date = match.group(2)
-                    clean_name = self._clean_job_title(job_name)
-                    normalized = normalize(clean_name)
-                    # Load stats from stats.json if exists, otherwise count PDFs
-                    stats = self._load_job_stats(folder)
-                    if stats:
-                        cv_count = stats.get('processed', 0)
-                        total_recovered = stats.get('total_recovered', cv_count)
-                    else:
-                        # Fallback: count PDFs + no_cv.txt entries
-                        cv_count = len(list(folder.rglob('*.pdf')))
-                        no_cv_file = folder / 'no_cv.txt'
-                        if no_cv_file.exists():
-                            with open(no_cv_file, 'r', encoding='utf-8') as f:
-                                cv_count += sum(1 for line in f if line.strip())
-                        total_recovered = cv_count  # No stats, assume all processed
-                    folder_info[folder.name] = {
-                        'original_name': job_name,
-                        'clean_name': clean_name,
-                        'normalized_name': normalized,
-                        'date': date,
-                        'cv_count': cv_count,
-                        'total_recovered': total_recovered,
-                        'matched_job_id': None  # Track which job matched this folder
-                    }
-                else:
-                    clean_name = self._clean_job_title(folder.name)
-                    normalized = normalize(clean_name)
-                    # Load stats from stats.json if exists, otherwise count PDFs
-                    stats = self._load_job_stats(folder)
-                    if stats:
-                        cv_count = stats.get('processed', 0)
-                        total_recovered = stats.get('total_recovered', cv_count)
-                    else:
-                        # Fallback: count PDFs + no_cv.txt entries
-                        cv_count = len(list(folder.rglob('*.pdf')))
-                        no_cv_file = folder / 'no_cv.txt'
-                        if no_cv_file.exists():
-                            with open(no_cv_file, 'r', encoding='utf-8') as f:
-                                cv_count += sum(1 for line in f if line.strip())
-                        total_recovered = cv_count  # No stats, assume all processed
-                    folder_info[folder.name] = {
-                        'original_name': folder.name,
-                        'clean_name': clean_name,
-                        'normalized_name': normalized,
-                        'date': None,
-                        'cv_count': cv_count,
-                        'total_recovered': total_recovered,
-                        'matched_job_id': None
-                    }
-
-        print(f"\n   {len(folder_info)} folders found in '{self.download_folder}/'")
-
-        # Match jobs with folders - each folder can only match ONE job
-        # First pass: match jobs that have exact name + date match (highest priority)
-        matched_count = 0
-        for job in jobs:
-            job_clean = job.get('title_clean', self._clean_job_title(job['title']))
-            job_normalized = normalize(job_clean)
-            job_date = job.get('date', '')
-            job_id = job['id']
-
-            # Only look for exact name + date matches in first pass
-            if not job_date:
-                continue
-
-            for folder_name, info in folder_info.items():
-                if info['matched_job_id'] is not None:
-                    continue
-
-                folder_normalized = info['normalized_name']
-                folder_date = info['date']
-
-                # Exact name + exact date match
-                if job_normalized == folder_normalized and folder_date == job_date:
-                    folder_info[folder_name]['matched_job_id'] = job_id
-                    existing[job_id] = {
-                        'title': job['title'],
-                        'title_clean': job_clean,
-                        'folder': folder_name,
-                        'cv_count': info['cv_count'],
-                        'total_recovered': info['total_recovered'],
-                        'total_candidates': job.get('total_candidates', 0),
-                        'date': job_date
-                    }
-                    matched_count += 1
-                    break
-
-        print(f"   {matched_count} folders match jobs")
-
-        # Second pass: for jobs without date match, try name-only match (only for folders without date)
-        for job in jobs:
-            job_id = job['id']
-            if job_id in existing:
-                continue  # Already matched
-
-            job_clean = job.get('title_clean', self._clean_job_title(job['title']))
-            job_normalized = normalize(job_clean)
-            job_date = job.get('date', '')
-
-            best_match = None
-            best_match_score = 0
-
-            for folder_name, info in folder_info.items():
-                if info['matched_job_id'] is not None:
-                    continue
-
-                folder_normalized = info['normalized_name']
-                folder_date = info['date']
-
-                # If both have dates and they don't match, skip this folder
-                if job_date and folder_date and job_date != folder_date:
-                    continue
-
-                score = 0
-
-                # Exact name match
-                if job_normalized == folder_normalized:
-                    # Higher score if dates match or no dates to compare
-                    if job_date and folder_date and job_date == folder_date:
-                        score = 4  # Best: exact name + exact date
-                    elif not job_date or not folder_date:
-                        score = 2  # Good: exact name, one or both missing date
-                    # If dates don't match, score stays 0 (skip)
-
-                # Partial match (one contains the other) - only for longer names
-                elif len(job_normalized) >= 10 and len(folder_normalized) >= 10:
-                    if job_normalized in folder_normalized or folder_normalized in job_normalized:
-                        if job_date and folder_date and job_date == folder_date:
-                            score = 3  # Good: partial name + exact date
-                        elif not job_date or not folder_date:
-                            score = 1  # OK: partial name, one or both missing date
-                        # If dates don't match, score stays 0 (skip)
-
-                if score > best_match_score:
-                    best_match_score = score
-                    best_match = folder_name
-
-            # If we found a match, mark the folder as matched
-            if best_match and best_match_score > 0:
-                folder_info[best_match]['matched_job_id'] = job_id
-                existing[job_id] = {
-                    'title': job['title'],
-                    'title_clean': job_clean,
-                    'folder': best_match,
-                    'cv_count': folder_info[best_match]['cv_count'],
-                    'total_recovered': folder_info[best_match]['total_recovered'],
-                    'total_candidates': job.get('total_candidates', 0),
-                    'date': job_date
-                }
-
-        return existing
-
-    def _ask_skip_existing_jobs(self, jobs: list, existing_jobs: dict) -> list:
-        """Ask user which existing jobs to skip
-
-        Args:
-            jobs: List of all jobs
-            existing_jobs: Dict of jobs that have existing folders
-        """
-        if not existing_jobs:
-            return jobs
-
-        print("\n" + "=" * 60)
-        print("JOBS ALREADY PRESENT IN THE DOWNLOADS FOLDER:")
-        print("=" * 60)
-
-        jobs_with_new = []
-        jobs_complete = []
-
-        for job_id, info in existing_jobs.items():
-            cv_count = info['cv_count']  # processed
-            total_recovered = info.get('total_recovered', cv_count)  # what API returned
-            total_announced = info['total_candidates']  # what job listing shows
-            # Use cleaned title for display
-            title = info.get('title_clean', info['title'])
-            folder = info['folder']
-            date = info.get('date', '')
-
-            # Format title with date for clarity
-            title_with_date = f"{title} ({date})" if date else title
-
-            # Compare with total_recovered (not total_announced) to determine completion
-            if cv_count < total_recovered:
-                jobs_with_new.append((job_id, info))
-                print(f"   [NEW] {title_with_date}")
-                print(f"         Folder: {folder}")
-                print(f"         {cv_count} processed / {total_recovered} fetched (+{total_recovered - cv_count} remaining)")
-            else:
-                jobs_complete.append((job_id, info))
-                # Show both recovered and announced if different
-                if total_recovered < total_announced:
-                    print(f"   [OK]  {title_with_date} ({cv_count}/{total_recovered} fetched, {total_announced} posted)")
-                else:
-                    print(f"   [OK]  {title_with_date} ({cv_count}/{total_announced})")
-
-        print()
-        if jobs_with_new:
-            print(f"   {len(jobs_with_new)} jobs with new candidates")
-        print(f"   {len(jobs_complete)} complete jobs")
-        print()
-        print("Options:")
-        print("   [S] SkipAll - Skip ALL existing jobs")
-        print("   [N] NewOnly - Only download jobs with new candidates")
-        print("   [K] KeepAll - Download every job anyway")
-        print()
-
-        while True:
-            choice = input("Your choice (S/N/K): ").strip().upper()
-
-            if choice == 'S':
-                # Skip all existing
-                jobs_to_skip = set(existing_jobs.keys())
-                filtered_jobs = [j for j in jobs if j['id'] not in jobs_to_skip]
-                print(f"\n{len(jobs_to_skip)} jobs skipped")
-                return filtered_jobs
-
-            elif choice == 'N':
-                # Only jobs with new candidates
-                jobs_with_new_ids = set(job_id for job_id, _ in jobs_with_new)
-                filtered_jobs = [j for j in jobs if j['id'] in jobs_with_new_ids]
-                print(f"\n{len(jobs_complete)} complete jobs skipped, {len(filtered_jobs)} to process")
-                return filtered_jobs
-
-            elif choice == 'K':
-                # Keep all
-                print("\nAll jobs will be processed")
-                return jobs
-
-            print("Invalid choice, type S, N or K")
-
     def _filter_old_jobs(self, jobs: list) -> list:
         """Filter out jobs older than 2 years (Indeed archives candidate data after ~2 years)"""
         from datetime import datetime, timedelta
@@ -3798,17 +3493,25 @@ class IndeedDownloader:
                 self.log.event('all_jobs_all_filtered_old', {})
             return
 
-        # Check for existing folders (compare by name, not checkpoint)
-        existing_jobs = self._find_existing_job_folders(jobs)
-
-        if existing_jobs:
-            jobs = self._ask_skip_existing_jobs(jobs, existing_jobs)
-
-        if not jobs:
-            print("No jobs to process!")
-            if self.log:
-                self.log.event('all_jobs_all_skipped_existing', {})
-            return
+        # Every job is re-checked. The old S/N/K prompt classified a job as
+        # complete by comparing stats.json to itself, so any job that had
+        # finished once was [OK] forever and option N silently dropped its
+        # new applicants. An id-level diff also catches churn a count
+        # comparison misses: one applicant withdraws, one arrives, the
+        # total is unchanged.
+        print("\n   Checking which applicants each job already has...")
+        for job in jobs:
+            folder = manifest_mod.resolve_job_folder(
+                Path(self.download_folder), job.get('id'), job.get('short_id')
+            )
+            existing = manifest_mod.load(folder) if folder else None
+            on_disk = len(existing['candidates']) if existing else 0
+            live = job.get('total_candidates', 0)
+            title = job.get('title_clean', job['title'])
+            if on_disk:
+                print(f"   {title}: {on_disk} on disk · {live} live")
+            else:
+                print(f"   {title}: new · {live} live")
 
         print(f"\n{len(jobs)} jobs to process")
         print("=" * 60)
@@ -3884,7 +3587,11 @@ class IndeedDownloader:
                 })
 
             try:
-                self._create_job_folder(job['title'], job['date'])
+                self._create_job_folder(
+                    job['title'], job['date'],
+                    employer_job_id=job.get('id'),
+                    short_id=job.get('short_id'),
+                )
 
                 if self.mode == 'backend':
                     # Synthetic IDs (title + date) cannot be passed to the GraphQL
