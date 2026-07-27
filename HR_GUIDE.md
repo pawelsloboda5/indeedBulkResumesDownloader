@@ -118,6 +118,7 @@ Close the console window when you're satisfied.
 | Chrome doesn't open | Another Chrome with the same profile is still running | Close all Chrome windows and double-click the .exe again |
 | "Cookies expired or invalid" or login page reappears | Your saved session expired (happens ~once a day) | Just log in again in the Chrome window when prompted |
 | A job downloads 0 CVs and 50 failed | Indeed rate-limited the API briefly | Re-run; the checkpoint will only retry the failed ones |
+| `⚠ Skipping — no Indeed employerJobId on the jobs-table link` | That specific job's row in your dashboard doesn't expose a real Indeed job ID (usually very old / archived jobs) | Skip it with Backend mode; re-run just that one job using Frontend mode (Option 2) |
 | Downloads going much slower than expected | Too many parallel requests, Indeed is throttling | Nothing to do — it'll finish, just slower |
 | Windows SmartScreen blocks the exe | The exe isn't code-signed | **More info** → **Run anyway** (one time) |
 | Console window instantly closes | Usually a Chrome version mismatch | Ping Pawel — he'll send a fresh build |
@@ -141,11 +142,16 @@ These are specific to this tool because you're handling candidate PII and a live
 - Don't leave it on a personal laptop indefinitely.
 
 **On the .exe itself:**
-- The SHA-256 hash Pawel gave you should match what you see if you run this in PowerShell:
+- If Pawel sends the .exe inside a `.zip`, **extract it first** — hash the extracted `.exe`, not the zip.
+- Expected SHA-256 for the current build (2026-04-29 audited source, rebuilt via CI 2026-07-07):
+  ```
+  6A4B74F44BC789C269254BE57CF4047A834B96D4294C0199869CD1280C3CB5E9
+  ```
+- Verify in PowerShell:
   ```
   Get-FileHash IndeedCVDownloader.exe -Algorithm SHA256
   ```
-- If the hash doesn't match, **stop and tell Pawel** — the file may have been altered in transit. Don't run it.
+- If the hash doesn't match what Pawel gave you, **stop and tell Pawel** — the file may have been altered in transit. Don't run it.
 
 ---
 
