@@ -463,3 +463,82 @@ def test_find_key_by_name_counts_case_variants_as_the_same_ambiguous_name():
     manifest.record(m, "id2", "john smith", "john smith (2)", True, "2026-07-27")
 
     assert manifest.find_key_by_name(m, "John Smith") is None
+
+
+def _seed_job_folder(root: Path, folder_name: str, job: dict) -> Path:
+    folder = root / folder_name
+    folder.mkdir(parents=True, exist_ok=True)
+    manifest.save(folder, manifest.new_manifest(job))
+    return folder
+
+
+def test_resolve_finds_folder_by_employer_job_id(tmp_path):
+    _seed_job_folder(tmp_path, "Cook (12-05-2026)", {"employer_job_id": "iri-abc"})
+    found = manifest.resolve_job_folder(tmp_path, "iri-abc", None)
+    assert found == tmp_path / "Cook (12-05-2026)"
+
+
+def test_resolve_finds_the_same_job_under_any_folder_name(tmp_path):
+    for name in ("Cook", "Cook (12-05-2026)", "Job_33723070"):
+        (tmp_path / name).mkdir()
+    manifest.save(tmp_path / "Job_33723070",
+                  manifest.new_manifest({"employer_job_id": "iri-abc", "short_id": "33723070"}))
+
+    assert manifest.resolve_job_folder(tmp_path, "iri-abc", None) == tmp_path / "Job_33723070"
+    assert manifest.resolve_job_folder(tmp_path, None, "33723070") == tmp_path / "Job_33723070"
+
+
+def test_resolve_prefers_employer_job_id_over_short_id(tmp_path):
+    _seed_job_folder(tmp_path, "Wrong", {"short_id": "111"})
+    _seed_job_folder(tmp_path, "Right", {"employer_job_id": "iri-abc", "short_id": "999"})
+
+    assert manifest.resolve_job_folder(tmp_path, "iri-abc", "111") == tmp_path / "Right"
+
+
+def test_resolve_returns_none_when_nothing_matches(tmp_path):
+    _seed_job_folder(tmp_path, "Cook", {"employer_job_id": "iri-other"})
+    assert manifest.resolve_job_folder(tmp_path, "iri-abc", None) is None
+
+
+def test_resolve_ignores_folders_without_a_manifest(tmp_path):
+    (tmp_path / "Legacy Folder").mkdir()
+    assert manifest.resolve_job_folder(tmp_path, "iri-abc", None) is None
+
+
+def test_resolve_handles_a_missing_download_root(tmp_path):
+    assert manifest.resolve_job_folder(tmp_path / "nope", "iri-abc", None) is None
+
+
+def test_resolve_ignores_empty_identifiers(tmp_path):
+    _seed_job_folder(tmp_path, "Cook", {"employer_job_id": "", "short_id": ""})
+    assert manifest.resolve_job_folder(tmp_path, "", "") is None
+    assert manifest.resolve_job_folder(tmp_path, None, None) is None
+
+
+def test_resolve_legacy_adopts_a_manifestless_folder_by_name(tmp_path):
+    (tmp_path / "Cook (12-05-2026)").mkdir()
+
+    found = manifest.resolve_legacy_folder_by_name(tmp_path, "Cook", "12-05-2026")
+
+    assert found == tmp_path / "Cook (12-05-2026)"
+
+
+def test_resolve_legacy_refuses_a_folder_whose_date_disagrees(tmp_path):
+    (tmp_path / "Cook (01-01-2020)").mkdir()
+
+    assert manifest.resolve_legacy_folder_by_name(tmp_path, "Cook", "12-05-2026") is None
+    # A dateless folder still matches — the old single-job path made those.
+    (tmp_path / "Cook").mkdir()
+    assert manifest.resolve_legacy_folder_by_name(tmp_path, "Cook", "12-05-2026") == tmp_path / "Cook"
+
+
+def test_resolve_legacy_leaves_a_folder_another_job_already_claimed(tmp_path):
+    # This is what keeps two same-titled jobs apart in one all-jobs run. Task 6
+    # writes a manifest into a folder the moment it adopts it, so the next job
+    # in the loop must not adopt that same folder by name and merge the two
+    # jobs' applicants. Only the ID path may return a folder that has a
+    # manifest, and only when the ID actually matches.
+    _seed_job_folder(tmp_path, "Cook", {"employer_job_id": "iri-first"})
+
+    assert manifest.resolve_legacy_folder_by_name(tmp_path, "Cook", None) is None
+    assert manifest.resolve_job_folder(tmp_path, "iri-second", None) is None

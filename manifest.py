@@ -354,3 +354,80 @@ def find_key_by_name(manifest: dict, name: str) -> Optional[str]:
     if len(matches) != 1:
         return None
     return matches[0]
+
+
+def resolve_job_folder(download_root: Path, employer_job_id: Optional[str],
+                       short_id: Optional[str]) -> Optional[Path]:
+    """Find this job's existing folder by Indeed job ID, whatever it's named.
+
+    Single-job mode names folders without a posting date, all-jobs mode with
+    one, and a generic page <h1> produces Job_<uuid8>. Matching on the ID
+    instead of the name collapses all of those onto one folder.
+
+    employer_job_id wins over short_id: it is the GraphQL identifier and the
+    more specific of the two.
+    """
+    root = Path(download_root)
+    if not root.exists():
+        return None
+
+    folders = [child for child in sorted(root.iterdir()) if child.is_dir()]
+    manifests = []
+    for child in folders:
+        data = load(child)
+        if data:
+            manifests.append((child, data.get("job") or {}))
+
+    if employer_job_id:
+        for child, job in manifests:
+            if job.get("employer_job_id") == employer_job_id:
+                return child
+    if short_id:
+        for child, job in manifests:
+            if job.get("short_id") == short_id:
+                return child
+    return None
+
+
+_DATED_FOLDER_RE = re.compile(r"^(.+) \((\d{2}-\d{2}-\d{4})\)$")
+
+
+def resolve_legacy_folder_by_name(download_root: Path, title_clean: str,
+                                  job_date: Optional[str]) -> Optional[Path]:
+    """Adopt a folder written by an older build, which has no manifest.
+
+    Replaces the fuzzy scoring in the old _find_existing_job_folders. When
+    both the job and the folder carry a date they must agree, so two
+    postings of the same title stay separate. A dateless folder matches
+    either way, because the old single-job path never wrote a date.
+
+    A folder that already HAS a manifest is skipped: it belongs to whichever
+    job id that manifest names, and resolve_job_folder is the only thing
+    allowed to hand it back. That skip is also what keeps an all-jobs run
+    from merging two same-titled jobs — the caller writes a manifest into a
+    folder the moment it adopts one, so the next job in the loop can no
+    longer claim it by name.
+    """
+    root = Path(download_root)
+    if not root.exists() or not title_clean:
+        return None
+
+    target = normalize_name(title_clean)
+    if not target:
+        return None
+
+    dateless_match = None
+    for child in sorted(root.iterdir()):
+        if not child.is_dir() or (child / MANIFEST_FILENAME).exists():
+            continue
+        matched = _DATED_FOLDER_RE.match(child.name)
+        folder_name, folder_date = (matched.group(1), matched.group(2)) if matched else (child.name, None)
+        if normalize_name(folder_name) != target:
+            continue
+        if folder_date and job_date:
+            if folder_date == job_date:
+                return child
+            continue
+        dateless_match = dateless_match or child
+
+    return dateless_match
