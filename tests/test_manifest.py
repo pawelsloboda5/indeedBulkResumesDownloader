@@ -77,6 +77,36 @@ def test_load_backs_up_valid_json_of_wrong_shape(tmp_path):
     assert (tmp_path / "manifest.corrupt-20260727_120001.json").exists()
 
 
+def test_load_rejects_a_manifest_whose_job_block_is_not_a_dict(tmp_path):
+    # The caller does `dict(loaded.get('job') or {})` and `loaded['job'].update(...)`
+    # on whatever comes back. A scalar here used to reach both and raise mid-run,
+    # with Chrome already open and part of the job downloaded.
+    (tmp_path / manifest.MANIFEST_FILENAME).write_text(
+        '{"schema": 1, "job": "Cook", "candidates": {}, "runs": []}', encoding="utf-8")
+    assert manifest.load(tmp_path, timestamp="20260727_120002") is None
+    assert (tmp_path / "manifest.corrupt-20260727_120002.json").exists()
+
+
+def test_load_rejects_a_manifest_whose_runs_is_not_a_list(tmp_path):
+    # `previous_runs + loaded['runs']` raises TypeError on anything else.
+    (tmp_path / manifest.MANIFEST_FILENAME).write_text(
+        '{"schema": 1, "job": {}, "candidates": {}, "runs": 3}', encoding="utf-8")
+    assert manifest.load(tmp_path, timestamp="20260727_120003") is None
+    assert (tmp_path / "manifest.corrupt-20260727_120003.json").exists()
+
+
+def test_load_accepts_everything_this_module_writes(tmp_path):
+    # The stricter gate must reject only hand-damaged files. A manifest that
+    # went through new_manifest, record and a run append still loads.
+    m = manifest.new_manifest({"title": "Cook"})
+    manifest.record(m, "id1", "Jane Smith", "Jane Smith", True, "2026-07-27")
+    m["runs"].append({"at": "2026-07-27T09:00:00", "fetched": 1})
+    manifest.save(tmp_path, m)
+
+    assert manifest.load(tmp_path) == m
+    assert not list(tmp_path.glob("manifest.corrupt-*.json"))
+
+
 def _make_candidate(job_folder: Path, name: str, resume_bytes: Optional[int]):
     folder = job_folder / name
     folder.mkdir(parents=True, exist_ok=True)
@@ -596,6 +626,32 @@ def test_resolve_legacy_handles_a_missing_download_root(tmp_path):
     assert manifest.resolve_legacy_folder_by_name(tmp_path / "nope", "Cook", None) is None
 
 
+def test_count_candidate_folders_counts_applicants_not_bookkeeping_files(tmp_path):
+    # The all-jobs pre-scan counts a manifest-less folder this way, so it has
+    # to see the applicants and ignore the files the tool drops beside them.
+    _make_candidate(tmp_path, "Jane Smith", 5000)
+    _make_candidate(tmp_path, "Bob Jones", None)
+    (tmp_path / "no_cv.txt").write_text("Carla Diaz\n", encoding="utf-8")
+    (tmp_path / "stats.json").write_text("{}", encoding="utf-8")
+
+    assert manifest.count_candidate_folders(tmp_path) == 2
+
+
+def test_count_candidate_folders_agrees_with_what_backfill_recovers(tmp_path):
+    # The summary line and the "Recovered N existing candidates from disk"
+    # line the job loop prints a moment later must not contradict each other.
+    for i in range(33):
+        _make_candidate(tmp_path, f"Person {i:02d}", 5000)
+
+    recovered = manifest.backfill_from_disk(tmp_path, {}, "2026-07-27")
+
+    assert manifest.count_candidate_folders(tmp_path) == len(recovered["candidates"]) == 33
+
+
+def test_count_candidate_folders_on_a_missing_folder_is_zero(tmp_path):
+    assert manifest.count_candidate_folders(tmp_path / "nope") == 0
+
+
 def test_diff_revisits_a_no_cv_entry_once_a_resume_appears():
     m = manifest.new_manifest({})
     manifest.record(m, "id1", "Jane Smith", None, False, "2026-07-27")
@@ -656,6 +712,42 @@ def test_app_data_lands_in_the_same_folder_as_the_resume(tmp_path):
 
     assert later_folder == cv_folder
     assert len([p for p in tmp_path.iterdir() if p.is_dir()]) == 1
+
+
+def test_two_same_name_applicants_are_only_separable_by_id(tmp_path):
+    """Why the app-data pass has to hand over the API dict it already holds.
+
+    Two Maria Garcias with different Indeed IDs come out of the CV pass in
+    two correct folders. A later pass that resolves by NAME cannot tell them
+    apart: find_key_by_name refuses an ambiguous name, both fall back to one
+    shared _nokey: key, and — nothing calls record() between the two
+    allocations — they get the SAME third folder, so both applicants'
+    screener Q&A lands in a phantom directory away from either resume.
+    Keying on entry_key instead returns each applicant their own folder.
+    """
+    m = manifest.new_manifest({})
+    first, second = _api("Maria Garcia", "id-aaa"), _api("Maria Garcia", "id-bbb")
+
+    for candidate in (first, second):
+        key = manifest.entry_key(candidate)
+        folder = manifest.allocate_candidate_folder(tmp_path, m, key, candidate["name"])
+        manifest.record(m, key, candidate["name"], folder.name, True, "2026-07-27")
+
+    assert m["candidates"]["id-aaa"]["folder"] == "Maria Garcia"
+    assert m["candidates"]["id-bbb"]["folder"] == "Maria Garcia (2)"
+
+    # The property the fix depends on: the id resolves, the shared name does not.
+    assert manifest.find_key_by_name(m, "Maria Garcia") is None
+    assert manifest.allocate_candidate_folder(
+        tmp_path, m, manifest.entry_key(first), "Maria Garcia") == tmp_path / "Maria Garcia"
+    assert manifest.allocate_candidate_folder(
+        tmp_path, m, manifest.entry_key(second), "Maria Garcia") == tmp_path / "Maria Garcia (2)"
+
+    # And the shape of the bug that made passing the dict necessary.
+    nokey = manifest.NOKEY_PREFIX + manifest.normalize_name("Maria Garcia")
+    phantom_a = manifest.allocate_candidate_folder(tmp_path, m, nokey, "Maria Garcia")
+    phantom_b = manifest.allocate_candidate_folder(tmp_path, m, nokey, "Maria Garcia")
+    assert phantom_a == phantom_b == tmp_path / "Maria Garcia (3)"
 
 
 def test_needs_backfill_is_true_when_there_is_no_manifest():

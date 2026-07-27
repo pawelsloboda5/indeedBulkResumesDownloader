@@ -2297,7 +2297,16 @@ class IndeedDownloader:
                     pbar.update(1)
                     continue
 
-                candidate_folder = self._candidate_folder_for(name)
+                # Pass the API dict, not just the name. The guard above already
+                # proved this candidate has a legacy_id, so entry_key returns
+                # the real Indeed ID and allocate_candidate_folder hands back
+                # the exact folder the CV pass recorded for it. Resolving by
+                # name instead breaks on duplicates: find_key_by_name refuses
+                # an ambiguous name, so two Maria Garcias both fall back to one
+                # _nokey: key and — nothing calls record() in this pass — get
+                # the SAME new folder, putting both applicants' screener Q&A in
+                # a phantom third directory away from either resume.
+                candidate_folder = self._candidate_folder_for(name, candidate)
 
                 # Navigate to this candidate's profile-DETAIL view. `legacyJobId`
                 # carries the job context so the profile's kebab menu includes
@@ -2977,7 +2986,16 @@ class IndeedDownloader:
             if not matches:
                 continue
 
-            candidate_folder = self._candidate_folder_for(name)
+            # Same reason as the app-data pass: the API dict is right here, so
+            # key on the Indeed ID rather than on a name that may be shared.
+            # Unlike that pass this sweep has no legacy-id guard in front of
+            # it, so hand the dict over only when it actually carries one.
+            # entry_key would otherwise return a _nokey: key directly and skip
+            # the name lookup that finds the folder the CV pass recorded —
+            # this way the id-less case degrades to exactly the old behavior.
+            candidate_folder = self._candidate_folder_for(
+                name, candidate if candidate.get('legacy_id') else None
+            )
             html_target = candidate_folder / "application.html"
 
             for f in matches:
@@ -3530,11 +3548,29 @@ class IndeedDownloader:
                 Path(self.download_folder), job.get('id'), job.get('short_id')
             )
             existing = manifest_mod.load(folder) if folder else None
-            on_disk = len(existing['candidates']) if existing else 0
             live = job.get('total_candidates', 0)
             title = job.get('title_clean', job['title'])
+            if existing:
+                print(f"   {title}: {len(existing['candidates'])} on disk · {live} live")
+                continue
+
+            # No manifest yet does NOT mean no downloads. On the first run
+            # after an upgrade every folder is manifest-less, and counting the
+            # manifest alone called all of them "new" — the one line HR reads
+            # while wondering whether her existing downloads are safe. The
+            # job loop recovers those folders a moment later ("Recovered 33
+            # existing candidates from disk"), so the summary was the only
+            # thing lying. Look the folder up the same way _create_job_folder
+            # will, and say where the count came from: a folder count and a
+            # manifest count are not the same number.
+            legacy_folder = manifest_mod.resolve_legacy_folder_by_name(
+                Path(self.download_folder),
+                self._clean_job_title(job.get('title') or '')[:80],
+                job.get('date') or None,
+            )
+            on_disk = manifest_mod.count_candidate_folders(legacy_folder) if legacy_folder else 0
             if on_disk:
-                print(f"   {title}: {on_disk} on disk · {live} live")
+                print(f"   {title}: {on_disk} on disk (from an older run, no manifest yet) · {live} live")
             else:
                 print(f"   {title}: new · {live} live")
 

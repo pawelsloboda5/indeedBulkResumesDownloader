@@ -109,6 +109,20 @@ def load(job_folder: Path, timestamp: Optional[str] = None) -> Optional[dict]:
     A corrupt or wrong-shaped file is copied aside before returning None.
     It must never silently return an empty manifest: silently-empty is what
     produces a full re-download of a folder that was already complete.
+
+    SHAPE IS CHECKED HERE SO NOTHING DOWNSTREAM HAS TO. manifest.json sits in
+    a folder HR opens, syncs and archives, so it can come back hand-edited or
+    truncated. Every caller then subscripts what load() handed it — the
+    downloader does `dict(loaded.get('job') or {})`, `previous_runs +
+    loaded['runs']` and `loaded['job'].update(...)`, and record()/write_no_cv
+    read `entry["name"]` — so a scalar `job` or a non-list `runs` raises
+    mid-run, after the browser is up and part of the job is downloaded.
+    Rejecting the file instead sends the caller down the backfill path, which
+    rebuilds the same state from the folders on disk.
+
+    Entries themselves are not validated: they are written only by this
+    module, and a per-entry sweep would be a wider change for a case nothing
+    on disk produces.
     """
     path = Path(job_folder) / MANIFEST_FILENAME
     if not path.exists():
@@ -121,7 +135,10 @@ def load(job_folder: Path, timestamp: Optional[str] = None) -> Optional[dict]:
     except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         data = None
 
-    if isinstance(data, dict) and isinstance(data.get("candidates"), dict):
+    if (isinstance(data, dict)
+            and isinstance(data.get("candidates"), dict)
+            and isinstance(data.get("job"), dict)
+            and isinstance(data.get("runs"), list)):
         return data
 
     stamp = timestamp or time.strftime("%Y%m%d_%H%M%S")
@@ -460,6 +477,24 @@ def resolve_legacy_folder_by_name(download_root: Path, title_clean: str,
     if len(candidates) != 1:
         return None
     return candidates[0]
+
+
+def count_candidate_folders(job_folder: Path) -> int:
+    """How many applicants a job folder holds, counted from disk alone.
+
+    For the pre-run summary over a folder written by an older build, which
+    has no manifest to count. Counts exactly what backfill_from_disk turns
+    into entries from the folder side — one per subdirectory — because
+    everything else this tool writes into a job folder is a file
+    (manifest.json, no_cv.txt, stats.json). It skips backfill's per-resume
+    stat call, so it stays cheap enough to run once per job before the run
+    starts, and it deliberately does not count no_cv.txt names: those are
+    applicants with no folder, and the summary is about what is on disk.
+    """
+    try:
+        return sum(1 for child in Path(job_folder).iterdir() if child.is_dir())
+    except OSError:
+        return 0
 
 
 def should_abort_empty_api(manifest: dict, fetched: int) -> bool:
