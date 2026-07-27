@@ -1209,8 +1209,12 @@ class IndeedDownloader:
         }
 
         loaded = manifest_mod.load(job_folder)
-        if loaded is None:
+        if manifest_mod.needs_backfill(loaded):
+            # Keep any run history the empty manifest already carried —
+            # backfill_from_disk starts from new_manifest and would drop it.
+            previous_runs = loaded.get('runs', []) if loaded else []
             loaded = manifest_mod.backfill_from_disk(job_folder, job_meta, today)
+            loaded['runs'] = previous_runs + loaded['runs']
             recovered = len(loaded['candidates'])
             if recovered:
                 print(f"   Recovered {recovered} existing candidates from disk")
@@ -2444,7 +2448,13 @@ class IndeedDownloader:
             short_id = None
             try:
                 params = parse_qs(urlparse(job_url).query)
-                candidate_short = params.get('legacyJobId', [None])[0] or params.get('id', [None])[0]
+                candidate_short = params.get('legacyJobId', [None])[0]
+                # `id` on a /candidates/view URL is the CANDIDATE's id, not the
+                # job's. Writing it into job.short_id would make this folder
+                # falsely match a different job later, so only trust `id` when
+                # we are not on a profile view.
+                if not candidate_short and '/candidates/view' not in urlparse(job_url).path:
+                    candidate_short = params.get('id', [None])[0]
                 if candidate_short and candidate_short != '0':
                     short_id = candidate_short
             except (ValueError, KeyError, IndexError):

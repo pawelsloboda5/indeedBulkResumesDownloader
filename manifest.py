@@ -470,3 +470,17 @@ def should_abort_empty_api(manifest: dict, fetched: int) -> bool:
     a good index, so the caller leaves every file untouched.
     """
     return fetched == 0 and bool(manifest.get("candidates"))
+
+
+def needs_backfill(manifest: Optional[dict]) -> bool:
+    """True when a job folder's contents must be recovered from disk.
+
+    Covers two cases. No manifest at all is the obvious one. An EMPTY manifest
+    is the subtle one: the Selenium download path writes resumes without ever
+    calling record(), so its folders carry a manifest with no candidates, and
+    keying recovery on `load() is None` alone would leave those resumes
+    invisible forever — and a later diff would re-download every one of them.
+    A genuinely empty job folder backfills to empty, so triggering here costs
+    nothing when there is nothing to find.
+    """
+    return manifest is None or not manifest.get("candidates")

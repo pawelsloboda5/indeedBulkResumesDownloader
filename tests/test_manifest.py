@@ -656,3 +656,19 @@ def test_app_data_lands_in_the_same_folder_as_the_resume(tmp_path):
 
     assert later_folder == cv_folder
     assert len([p for p in tmp_path.iterdir() if p.is_dir()]) == 1
+
+
+def test_needs_backfill_is_true_when_there_is_no_manifest():
+    assert manifest.needs_backfill(None) is True
+
+
+def test_needs_backfill_is_true_when_the_manifest_has_no_candidates():
+    """Frontend mode writes resumes but no entries, so load() succeeds on an
+    empty manifest and would otherwise skip recovery forever."""
+    assert manifest.needs_backfill(manifest.new_manifest({"title": "Cook"})) is True
+
+
+def test_needs_backfill_is_false_once_entries_exist():
+    m = manifest.new_manifest({})
+    manifest.record(m, "id1", "Jane Smith", "Jane Smith", True, "2026-07-27")
+    assert manifest.needs_backfill(m) is False
