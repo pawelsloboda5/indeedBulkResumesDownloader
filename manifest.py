@@ -1,0 +1,96 @@
+"""Per-job download manifest.
+
+Single source of truth for which candidates a job folder already holds.
+Lives inside the job folder (not in logs/) so it survives HR deleting
+logs/, archiving downloads/ to the document management system, and
+launching the .exe from a different working directory — the three things
+that used to reset all re-run state.
+
+Standard library only, no Selenium, no network, no IndeedDownloader
+state: every function here is a pure transformation over dicts and paths
+so it can be tested without a browser.
+"""
+
+import json
+import os
+import re
+import shutil
+import time
+import unicodedata
+from pathlib import Path
+from typing import Optional
+
+SCHEMA_VERSION = 1
+MANIFEST_FILENAME = "manifest.json"
+NO_CV_FILENAME = "no_cv.txt"
+RESUME_FILENAME = "resume.pdf"
+
+# Matches the accept threshold in download_cv_api — anything smaller is a
+# truncated or error-page download, not a resume.
+MIN_RESUME_BYTES = 1000
+
+# Key prefixes for entries that have no Indeed legacyID yet.
+BACKFILL_PREFIX = "_backfill:"   # recovered from disk, awaiting promotion
+NOKEY_PREFIX = "_nokey:"         # API returned the candidate without an ID
+
+
+def normalize_name(s: str) -> str:
+    """Aggressive form used only for MATCHING two spellings of one person.
+
+    Not for naming folders — see sanitize_folder_name for that.
+    """
+    s = unicodedata.normalize("NFKD", s or "").encode("ASCII", "ignore").decode("ASCII")
+    s = re.sub(r"[^a-z0-9\s]", "", s.lower())
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def sanitize_folder_name(name: str) -> str:
+    """Readable form used to NAME a candidate folder a human will browse."""
+    safe = "".join(c for c in (name or "") if c.isalnum() or c in (" ", "-", "_")).strip()
+    return safe or "unknown"
+
+
+def new_manifest(job: dict) -> dict:
+    return {"schema": SCHEMA_VERSION, "job": dict(job or {}), "candidates": {}, "runs": []}
+
+
+def write_atomic(path: Path, data: dict) -> None:
+    """Write via a temp file + os.replace so an interrupted run can never
+    leave a half-written index behind."""
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def save(job_folder: Path, manifest: dict) -> None:
+    write_atomic(Path(job_folder) / MANIFEST_FILENAME, manifest)
+
+
+def load(job_folder: Path, timestamp: Optional[str] = None) -> Optional[dict]:
+    """Return the manifest, or None if there isn't a usable one.
+
+    A corrupt or wrong-shaped file is copied aside before returning None.
+    It must never silently return an empty manifest: silently-empty is what
+    produces a full re-download of a folder that was already complete.
+    """
+    path = Path(job_folder) / MANIFEST_FILENAME
+    if not path.exists():
+        return None
+
+    data = None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        data = None
+
+    if isinstance(data, dict) and isinstance(data.get("candidates"), dict):
+        return data
+
+    stamp = timestamp or time.strftime("%Y%m%d_%H%M%S")
+    try:
+        shutil.copy2(path, Path(job_folder) / f"manifest.corrupt-{stamp}.json")
+    except OSError:
+        pass
+    return None
