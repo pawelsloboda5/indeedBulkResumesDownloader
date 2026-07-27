@@ -94,3 +94,54 @@ def load(job_folder: Path, timestamp: Optional[str] = None) -> Optional[dict]:
     except OSError:
         pass
     return None
+
+
+def backfill_from_disk(job_folder: Path, job: dict, today: str) -> dict:
+    """Rebuild a manifest for a job folder downloaded by an older build.
+
+    Candidate subdirectories become _backfill: entries keyed on the
+    normalized folder name. They carry no Indeed ID yet; promote_backfilled
+    swaps in the real legacyID during the next API pass, so nothing gets
+    re-downloaded.
+    """
+    job_folder = Path(job_folder)
+    m = new_manifest(job)
+
+    for child in sorted(job_folder.iterdir()):
+        if not child.is_dir():
+            continue
+        resume = child / RESUME_FILENAME
+        has_cv = resume.exists() and resume.stat().st_size > MIN_RESUME_BYTES
+        m["candidates"][BACKFILL_PREFIX + normalize_name(child.name)] = {
+            "name": child.name,
+            "folder": child.name,
+            "has_cv": has_cv,
+            "stale": False,
+            "first_seen": today,
+            "last_seen": today,
+        }
+
+    no_cv = job_folder / NO_CV_FILENAME
+    if no_cv.exists():
+        try:
+            lines = no_cv.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError):
+            lines = []
+        for line in lines:
+            name = line.strip()
+            if not name:
+                continue
+            key = BACKFILL_PREFIX + normalize_name(name)
+            # A real folder on disk always wins over a no_cv.txt line.
+            if key in m["candidates"]:
+                continue
+            m["candidates"][key] = {
+                "name": name,
+                "folder": None,
+                "has_cv": False,
+                "stale": False,
+                "first_seen": today,
+                "last_seen": today,
+            }
+
+    return m
