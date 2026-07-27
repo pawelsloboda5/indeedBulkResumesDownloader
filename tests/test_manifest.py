@@ -159,3 +159,84 @@ def test_backfill_keeps_non_latin_candidates_distinct(tmp_path):
     assert len(m["candidates"]) == 2
     assert {e["folder"] for e in m["candidates"].values()} == {"李伟", "王芳"}
     assert manifest.BACKFILL_PREFIX not in m["candidates"]
+
+
+def _api(name, legacy_id, has_url=True):
+    return {"name": name, "legacy_id": legacy_id,
+            "download_url": "https://x/cv" if has_url else None}
+
+
+def test_entry_key_uses_legacy_id_when_present():
+    assert manifest.entry_key(_api("Jane Smith", "abc123")) == "abc123"
+
+
+def test_entry_key_falls_back_to_name_when_id_missing():
+    assert manifest.entry_key(_api("Jane Smith", None)) == "_nokey:jane smith"
+
+
+def test_promote_rewrites_backfilled_key_and_keeps_folder(tmp_path):
+    _make_candidate(tmp_path, "Jane Smith", 5000)
+    m = manifest.backfill_from_disk(tmp_path, {}, "2026-07-27")
+
+    promoted = manifest.promote_backfilled(m, [_api("Jane Smith", "abc123")])
+
+    assert promoted == 1
+    assert "_backfill:jane smith" not in m["candidates"]
+    assert m["candidates"]["abc123"]["folder"] == "Jane Smith"
+    assert m["candidates"]["abc123"]["has_cv"] is True
+    assert m["candidates"]["abc123"]["first_seen"] == "2026-07-27"
+
+
+def test_promote_matches_across_accent_and_case_differences(tmp_path):
+    _make_candidate(tmp_path, "renee dupont", 5000)
+    m = manifest.backfill_from_disk(tmp_path, {}, "2026-07-27")
+
+    assert manifest.promote_backfilled(m, [_api("Renée Dupont", "xyz")]) == 1
+    assert m["candidates"]["xyz"]["folder"] == "renee dupont"
+
+
+def test_promote_leaves_unmatched_backfill_entries_alone(tmp_path):
+    _make_candidate(tmp_path, "Jane Smith", 5000)
+    _make_candidate(tmp_path, "Gone Person", 5000)
+    m = manifest.backfill_from_disk(tmp_path, {}, "2026-07-27")
+
+    manifest.promote_backfilled(m, [_api("Jane Smith", "abc123")])
+
+    assert "_backfill:gone person" in m["candidates"]
+
+
+def test_diff_returns_only_unknown_candidates(tmp_path):
+    m = manifest.new_manifest({})
+    m["candidates"]["known1"] = {"name": "A", "folder": "A", "has_cv": True,
+                                 "stale": False, "first_seen": "x", "last_seen": "x"}
+
+    todo = manifest.diff(m, [_api("A", "known1"), _api("B", "new1"), _api("C", "new2")])
+
+    assert [c["legacy_id"] for c in todo] == ["new1", "new2"]
+
+
+def test_diff_after_promotion_reproduces_the_reported_scenario(tmp_path):
+    for i in range(33):
+        _make_candidate(tmp_path, f"Person {i:02d}", 5000)
+    m = manifest.backfill_from_disk(tmp_path, {}, "2026-07-27")
+
+    api = [_api(f"Person {i:02d}", f"id{i:02d}") for i in range(38)]
+    manifest.promote_backfilled(m, api)
+    todo = manifest.diff(m, api)
+
+    assert len(todo) == 5
+    assert [c["legacy_id"] for c in todo] == [f"id{i}" for i in range(33, 38)]
+
+
+def test_mark_stale_flags_candidates_the_api_stopped_returning():
+    m = manifest.new_manifest({})
+    for key in ("a", "b"):
+        m["candidates"][key] = {"name": key, "folder": key, "has_cv": True,
+                                "stale": False, "first_seen": "old", "last_seen": "old"}
+
+    manifest.mark_stale(m, [_api("a", "a")], "2026-07-30")
+
+    assert m["candidates"]["a"]["stale"] is False
+    assert m["candidates"]["a"]["last_seen"] == "2026-07-30"
+    assert m["candidates"]["b"]["stale"] is True
+    assert m["candidates"]["b"]["last_seen"] == "old"

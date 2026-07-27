@@ -157,3 +157,58 @@ def backfill_from_disk(job_folder: Path, job: dict, today: str) -> dict:
             }
 
     return m
+
+
+def entry_key(candidate: dict) -> str:
+    """Manifest key for an API candidate.
+
+    Indeed's legacyID identifies a submission, so it is unique per job and
+    exact. Candidates that arrive without one fall back to a name-derived
+    key, which is weaker but still beats re-downloading them every run.
+    """
+    legacy_id = candidate.get("legacy_id")
+    if legacy_id:
+        return str(legacy_id)
+    return NOKEY_PREFIX + normalize_name(candidate.get("name", ""))
+
+
+def promote_backfilled(manifest: dict, api_candidates: list) -> int:
+    """Swap _backfill: keys for real legacyIDs by matching on normalized name.
+
+    Mutates `manifest` in place. Returns how many entries were promoted.
+    Runs before diff() so a backfilled folder is never re-downloaded.
+    """
+    promoted = 0
+    for candidate in api_candidates:
+        legacy_id = candidate.get("legacy_id")
+        if not legacy_id or legacy_id in manifest["candidates"]:
+            continue
+        backfill_key = BACKFILL_PREFIX + normalize_name(candidate.get("name", ""))
+        entry = manifest["candidates"].pop(backfill_key, None)
+        if entry is None:
+            continue
+        entry["name"] = candidate.get("name") or entry["name"]
+        manifest["candidates"][str(legacy_id)] = entry
+        promoted += 1
+    return promoted
+
+
+def diff(manifest: dict, api_candidates: list) -> list:
+    """API candidates that aren't in the manifest yet, in API order."""
+    known = manifest["candidates"]
+    return [c for c in api_candidates if entry_key(c) not in known]
+
+
+def mark_stale(manifest: dict, api_candidates: list, today: str) -> None:
+    """Refresh last_seen for everyone the API returned; flag the rest stale.
+
+    Stale entries are kept. This tool never removes a candidate from a job
+    folder or its manifest.
+    """
+    seen = {entry_key(c) for c in api_candidates}
+    for key, entry in manifest["candidates"].items():
+        if key in seen:
+            entry["last_seen"] = today
+            entry["stale"] = False
+        else:
+            entry["stale"] = True
