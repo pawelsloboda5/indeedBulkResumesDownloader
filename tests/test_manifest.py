@@ -489,10 +489,15 @@ def test_resolve_finds_the_same_job_under_any_folder_name(tmp_path):
 
 
 def test_resolve_prefers_employer_job_id_over_short_id(tmp_path):
-    _seed_job_folder(tmp_path, "Wrong", {"short_id": "111"})
-    _seed_job_folder(tmp_path, "Right", {"employer_job_id": "iri-abc", "short_id": "999"})
+    # Named so the short_id-only folder sorts FIRST. Precedence has to come
+    # from the two-pass structure — all employer_job_id candidates, then all
+    # short_id candidates — not from directory order. A single per-folder pass
+    # that checks employer then short on each folder in turn would return
+    # "Aaa wrong" here, and this is what rules that structure out.
+    _seed_job_folder(tmp_path, "Aaa wrong", {"short_id": "111"})
+    _seed_job_folder(tmp_path, "Zzz right", {"employer_job_id": "iri-abc", "short_id": "999"})
 
-    assert manifest.resolve_job_folder(tmp_path, "iri-abc", "111") == tmp_path / "Right"
+    assert manifest.resolve_job_folder(tmp_path, "iri-abc", "111") == tmp_path / "Zzz right"
 
 
 def test_resolve_returns_none_when_nothing_matches(tmp_path):
@@ -542,3 +547,50 @@ def test_resolve_legacy_leaves_a_folder_another_job_already_claimed(tmp_path):
 
     assert manifest.resolve_legacy_folder_by_name(tmp_path, "Cook", None) is None
     assert manifest.resolve_job_folder(tmp_path, "iri-second", None) is None
+
+
+def test_resolve_legacy_refuses_two_dated_folders_when_the_job_has_no_date(tmp_path):
+    # Single-job mode — the mode this whole task exists to fix — has no posting
+    # date, so it cannot tell these two apart. Latching the sorted-first one
+    # picks 14-01-2026 over 22-09-2025 because '1' < '2': the format is
+    # DD-MM-YYYY, so that is ordering by DAY OF MONTH, not by recency. The
+    # current posting's applicants would land in an unrelated posting's
+    # directory. The manifest skip cannot save this — on the first run after
+    # upgrade neither folder has a manifest.
+    (tmp_path / "Cook (14-01-2026)").mkdir()
+    (tmp_path / "Cook (22-09-2025)").mkdir()
+
+    assert manifest.resolve_legacy_folder_by_name(tmp_path, "Cook", None) is None
+
+
+def test_resolve_legacy_adopts_a_single_dated_folder_when_the_job_has_no_date(tmp_path):
+    # The refusal above must not cost the adoption this task exists for. One
+    # unambiguous dated folder is still the right answer for a dateless
+    # single-job run: this is the "Cook (12-05-2026) written by all-jobs mode,
+    # re-run in single-job mode" case that used to fork a second folder.
+    (tmp_path / "Cook (14-01-2026)").mkdir()
+
+    found = manifest.resolve_legacy_folder_by_name(tmp_path, "Cook", None)
+
+    assert found == tmp_path / "Cook (14-01-2026)"
+
+
+def test_resolve_legacy_prefers_an_exact_date_over_a_dateless_folder(tmp_path):
+    # "Cook" sorts before "Cook (12-05-2026)", so anything that returns the
+    # first acceptable candidate rather than holding out for the date match
+    # answers "Cook" — a wrong-folder resolution with the right folder sitting
+    # right there. An agreeing date is the strongest evidence available and
+    # must win over a dateless fallback regardless of directory order.
+    (tmp_path / "Cook").mkdir()
+    (tmp_path / "Cook (12-05-2026)").mkdir()
+
+    found = manifest.resolve_legacy_folder_by_name(tmp_path, "Cook", "12-05-2026")
+
+    assert found == tmp_path / "Cook (12-05-2026)"
+
+
+def test_resolve_legacy_handles_a_missing_download_root(tmp_path):
+    # Task 6 calls this before backfill_from_disk, which raises
+    # FileNotFoundError on a missing folder. Degrading to None keeps the
+    # first-ever run — no download root yet — off that path.
+    assert manifest.resolve_legacy_folder_by_name(tmp_path / "nope", "Cook", None) is None

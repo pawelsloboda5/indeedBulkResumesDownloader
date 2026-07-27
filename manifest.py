@@ -407,6 +407,18 @@ def resolve_legacy_folder_by_name(download_root: Path, title_clean: str,
     from merging two same-titled jobs — the caller writes a manifest into a
     folder the moment it adopts one, so the next job in the loop can no
     longer claim it by name.
+
+    AN AGREEING DATE WINS IMMEDIATELY. It is the strongest evidence on offer,
+    so it must beat a dateless folder that happens to sort earlier.
+
+    ANYTHING ELSE AMBIGUOUS IS REFUSED, matching find_key_by_name's rule that
+    more than one candidate means no answer. Single-job mode carries no
+    posting date, so against `Cook (14-01-2026)` and `Cook (22-09-2025)` it
+    has nothing to choose on — and choosing the first sorts by DAY OF MONTH,
+    since the folder format is DD-MM-YYYY, not by recency. Returning None
+    makes the caller create a folder instead. A duplicate folder is
+    recoverable by hand; a merged one is not, because once two postings'
+    applicants share a directory nothing records which came from where.
     """
     root = Path(download_root)
     if not root.exists() or not title_clean:
@@ -416,7 +428,7 @@ def resolve_legacy_folder_by_name(download_root: Path, title_clean: str,
     if not target:
         return None
 
-    dateless_match = None
+    candidates = []
     for child in sorted(root.iterdir()):
         if not child.is_dir() or (child / MANIFEST_FILENAME).exists():
             continue
@@ -428,6 +440,8 @@ def resolve_legacy_folder_by_name(download_root: Path, title_clean: str,
             if folder_date == job_date:
                 return child
             continue
-        dateless_match = dateless_match or child
+        candidates.append(child)
 
-    return dateless_match
+    if len(candidates) != 1:
+        return None
+    return candidates[0]
