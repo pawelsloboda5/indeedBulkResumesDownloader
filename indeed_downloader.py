@@ -30,6 +30,13 @@ from tqdm import tqdm
 import platform
 import traceback
 
+# Per-job download manifest. A plain top-level import on purpose: PyInstaller
+# follows static imports during Analysis and bundles manifest.py into the
+# --onefile .exe with no spec change. A dynamic importlib.import_module runs
+# fine from source and then raises ModuleNotFoundError inside the binary HR
+# actually runs.
+import manifest as manifest_mod
+
 # Load environment variables
 load_dotenv('.env.config')
 
@@ -210,7 +217,8 @@ class IndeedDownloader:
         self.current_job_legacy_id = None  # Short id from URL `id=` (used by /candidates/view profile URL as `legacyJobId=`)
         self.current_job_name = None
         self.current_job_folder = None
-        self.current_job_is_existing = False  # True if job folder already existed
+        self.current_manifest = None       # dict, set by _create_job_folder
+        self.current_job_identifiers = {}  # {'employer_job_id': str, 'short_id': str}
 
         # Checkpoint
         self.checkpoint_file = Path(self.log_folder) / 'checkpoint_unified.json'
@@ -1157,23 +1165,60 @@ class IndeedDownloader:
                 pass
         return None
 
-    def _create_job_folder(self, job_name: str, job_date: str = None) -> Path:
-        """Create folder for job with name and date"""
-        # Clean job name for folder
-        safe_name = self._clean_job_title(job_name)
-        safe_name = safe_name[:80]  # Limit length
+    def _create_job_folder(self, job_name: str, job_date: str = None,
+                           employer_job_id: str = None, short_id: str = None) -> Path:
+        """Resolve (or create) this job's folder and load its manifest.
 
-        if job_date:
-            folder_name = f"{safe_name} ({job_date})"
+        Identity comes from the Indeed job id via the manifest, so a job
+        downloaded once in single-job mode and again in all-jobs mode lands
+        in the same folder even though the two modes name folders
+        differently. Falls back to name-and-date only for folders written
+        by an older build.
+        """
+        today = time.strftime('%Y-%m-%d')
+        self.current_job_identifiers = {
+            'employer_job_id': employer_job_id or '',
+            'short_id': short_id or '',
+        }
+
+        safe_name = self._clean_job_title(job_name)[:80]
+
+        # 1. By Indeed job id via the manifest — exact, name-independent.
+        job_folder = manifest_mod.resolve_job_folder(
+            Path(self.download_folder), employer_job_id, short_id
+        )
+        # 2. By name, for folders an older build wrote with no manifest.
+        if job_folder is None:
+            job_folder = manifest_mod.resolve_legacy_folder_by_name(
+                Path(self.download_folder), safe_name, job_date
+            )
+            if job_folder is not None:
+                print(f"   Adopting existing folder: {job_folder.name}")
+        # 3. Otherwise a new folder.
+        if job_folder is None:
+            folder_name = f"{safe_name} ({job_date})" if job_date else safe_name
+            job_folder = Path(self.download_folder) / folder_name
+
+        job_folder.mkdir(parents=True, exist_ok=True)
+
+        job_meta = {
+            'title': job_name,
+            'posted_date': job_date or '',
+            'employer_job_id': employer_job_id or '',
+            'short_id': short_id or '',
+        }
+
+        loaded = manifest_mod.load(job_folder)
+        if loaded is None:
+            loaded = manifest_mod.backfill_from_disk(job_folder, job_meta, today)
+            recovered = len(loaded['candidates'])
+            if recovered:
+                print(f"   Recovered {recovered} existing candidates from disk")
         else:
-            folder_name = safe_name
+            loaded['job'].update({k: v for k, v in job_meta.items() if v})
 
-        job_folder = Path(self.download_folder) / folder_name
-
-        # Check if folder already exists (has PDFs)
-        self.current_job_is_existing = job_folder.exists() and any(job_folder.rglob('*.pdf'))
-
-        job_folder.mkdir(exist_ok=True)
+        self.current_manifest = loaded
+        manifest_mod.save(job_folder, self.current_manifest)
 
         self.current_job_folder = job_folder
         self._point_chrome_downloads_at(job_folder)
@@ -1402,15 +1447,29 @@ class IndeedDownloader:
             print(f"❌ API error: {e}")
             return [], 0, False
 
+    def _candidate_folder_for(self, name: str, candidate: dict = None) -> Path:
+        """Resolve (and create) one candidate's folder, consistently.
+
+        download_cv_api has the API dict and keys on the legacyID. The
+        app-data pass and the Selenium path see a display name only, so they
+        look the key up by name first. Without that lookup the two flows
+        allocate different folders and the screener Q&A files land away from
+        the resume.
+        """
+        if candidate is not None:
+            key = manifest_mod.entry_key(candidate)
+        else:
+            key = (manifest_mod.find_key_by_name(self.current_manifest, name)
+                   or manifest_mod.NOKEY_PREFIX + manifest_mod.normalize_name(name))
+        return manifest_mod.allocate_candidate_folder(
+            self.current_job_folder, self.current_manifest, key, name
+        )
+
     def download_cv_api(self, candidate: dict) -> bool:
         """Download CV via API"""
         name = candidate['name']
         legacy_id = candidate['legacy_id']
         download_url = candidate['download_url']
-
-        if legacy_id in self.checkpoint_data['downloaded_ids']:
-            self.stats['skipped'] += 1
-            return True
 
         try:
             js_code = f"""
@@ -1440,13 +1499,21 @@ class IndeedDownloader:
 
             pdf_data = base64.b64decode(base64_data)
 
-            candidate_folder = self._create_candidate_folder(name)
+            key = manifest_mod.entry_key(candidate)
+            candidate_folder = self._candidate_folder_for(name, candidate)
             filepath = candidate_folder / "resume.pdf"
 
             with open(filepath, 'wb') as f:
                 f.write(pdf_data)
 
-            if filepath.stat().st_size > 1000:
+            if filepath.stat().st_size > manifest_mod.MIN_RESUME_BYTES:
+                manifest_mod.record(
+                    self.current_manifest, key, name, candidate_folder.name,
+                    True, time.strftime('%Y-%m-%d'),
+                )
+                # Persist after every candidate so a killed run resumes
+                # exactly where it stopped — the guarantee HR_GUIDE makes.
+                manifest_mod.save(self.current_job_folder, self.current_manifest)
                 self._save_checkpoint(name=name, legacy_id=legacy_id)
                 self.stats['downloaded'] += 1
                 return True
@@ -1791,40 +1858,29 @@ class IndeedDownloader:
             pct = (len(all_candidates_list) / total_expected) * 100
             print(f"   Note: {missing} candidates not fetched ({pct:.1f}% fetched)")
 
-        # Load already processed names (PDFs + no_cv.txt)
-        processed_names = set()
-        if self.current_job_folder and self.current_job_folder.exists():
-            # Scan PDF files
-            for pdf_file in self.current_job_folder.rglob('*.pdf'):
-                # Format: "Jean Dupont_20251126_154317.pdf"
-                name_part = pdf_file.stem.rsplit('_', 2)[0]  # Get "Jean Dupont"
-                if name_part:
-                    clean_name = "".join(ch for ch in name_part if ch.isalnum() or ch in (' ', '-', '_')).strip().lower()
-                    processed_names.add(clean_name)
+        # Diff against the manifest. The previous implementation scanned PDF
+        # filenames with rsplit('_', 2), a shape this code stopped producing
+        # when downloads moved to <candidate>/resume.pdf — every file
+        # resolved to the string "resume", so already_processed was always 0
+        # and nothing was ever recognised as already downloaded.
+        today = time.strftime('%Y-%m-%d')
+        promoted = manifest_mod.promote_backfilled(self.current_manifest, all_candidates_list)
+        if promoted:
+            print(f"   Matched {promoted} existing candidates to Indeed ids")
 
-            # Load no_cv.txt (candidates without CV)
-            no_cv_file = self.current_job_folder / 'no_cv.txt'
-            if no_cv_file.exists():
-                with open(no_cv_file, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        name = line.strip()
-                        if name:
-                            clean_name = "".join(ch for ch in name if ch.isalnum() or ch in (' ', '-', '_')).strip().lower()
-                            processed_names.add(clean_name)
+        to_fetch = manifest_mod.diff(self.current_manifest, all_candidates_list)
+        already_processed = len(all_candidates_list) - len(to_fetch)
 
-        # Separate candidates with CV and without CV
-        candidates_with_cv = []
-        candidates_no_cv = []
-        already_processed = 0
-        for c in all_candidates_list:
-            clean_name = "".join(ch for ch in c['name'] if ch.isalnum() or ch in (' ', '-', '_')).strip().lower()
-            if clean_name in processed_names:
-                already_processed += 1
-                continue  # Already processed
-            if c['download_url']:
-                candidates_with_cv.append(c)
-            else:
-                candidates_no_cv.append(c)
+        candidates_with_cv = [c for c in to_fetch if c['download_url']]
+        candidates_no_cv = [c for c in to_fetch if not c['download_url']]
+
+        for c in candidates_no_cv:
+            manifest_mod.record(
+                self.current_manifest, manifest_mod.entry_key(c),
+                c['name'], None, False, today,
+            )
+        if candidates_no_cv:
+            print(f"   {len(candidates_no_cv)} new candidates without a CV")
 
         # Save candidates without CV to no_cv.txt
         if candidates_no_cv and self.current_job_folder:
