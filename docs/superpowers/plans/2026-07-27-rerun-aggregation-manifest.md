@@ -6,7 +6,9 @@
 
 **Architecture:** A per-job `manifest.json` keyed on Indeed's `legacyID` becomes the single source of truth for what is already on disk. It lives inside the job folder, so it survives deleting `logs\`, moving `downloads\` to a document management system, and launching the .exe from a different directory. All identity logic moves into a new `manifest.py` of pure functions so it can be tested without a browser; `indeed_downloader.py` keeps the Selenium and GraphQL work and calls into it.
 
-**Tech Stack:** Python 3.11, pytest (new, dev-only), PyInstaller 6.3.0 `--onefile`, Selenium 4.16.0, undetected-chromedriver 3.5.5.
+**Tech Stack:** pytest (new, dev-only), PyInstaller 6.3.0 `--onefile`, Selenium 4.16.0, undetected-chromedriver 3.5.5.
+
+**Python version split (discovered during Task 2, 2026-07-27):** CI builds the .exe on **3.11** (`build-exe.yml`), but the local `python3` these tests run under is **3.9.6**. Code must be valid on 3.9: use `Optional[X]` from `typing`, never PEP 604 `X | None`, which raises `TypeError` at collection time on 3.9. The repo already follows this convention — `indeed_downloader.py` uses `Optional[...]` throughout and contains zero `X | None`. Any `str | None` appearing in an **Interfaces** block below is prose describing a nullable value, not source to transcribe.
 
 **Spec:** `docs/superpowers/specs/2026-07-27-indeed-downloader-rerun-aggregation-design.md`
 
@@ -21,6 +23,8 @@
 - This tool never deletes a candidate folder or a resume. Candidates Indeed stops returning get `stale: true` and stay.
 - `MIN_RESUME_BYTES = 1000`, matching the existing accept threshold at `download_cv_api:1449`.
 - Never `git add .` or `git add -A`. The repo has untracked PII (`indeed_cookies.json`, `image.png`, report files). Stage named paths only.
+
+**Amendment 1 — `normalize_name` empty-key fallback (ruled 2026-07-27, during Task 2).** As originally written below, `normalize_name` returns `""` for any name with no ASCII-Latin characters (Cyrillic, Arabic, CJK, Greek, Hebrew), so every such applicant collapses onto the single key `_backfill:`. Task 2 only under-populates the manifest as a result, but Task 3's `promote_backfilled` would then bind one applicant's Indeed `legacyID` to an entry whose `folder` points at a different applicant's directory, and later writes would land in the wrong person's folder. `normalize_name` now falls back to the lowercased, whitespace-collapsed raw name when the ASCII pipeline yields empty, so two distinct non-Latin names produce two distinct keys. Behavior for any name that already normalized non-empty is unchanged. This intentionally drops the "exact parity with `indeed_downloader.py:3421`" rationale cited in Task 1: that function lives inside `_find_existing_job_folders`, which Task 8 deletes, and the only surviving `normalize_name` consumer outside candidate matching is job-title matching, where titles are Latin. Because the fix lives in `normalize_name` itself, every downstream key derivation (`backfill_from_disk`, `promote_backfilled`, `entry_key`, `find_key_by_name`) inherits it with no further change — Tasks 3 through 9 below need no edit.
 
 ## File Structure
 
@@ -1229,6 +1233,81 @@ git commit -m "fix(rerun): diff against the manifest instead of a filename scan 
 - Consumes: `write_no_cv`, `mark_stale`, `save` from Tasks 3-4.
 - Produces: no new public interfaces.
 
+**Amendment 4 — `diff` must revisit a no-CV entry when a resume appears (ruled 2026-07-27, during Task 6).** `diff` keys purely on manifest membership, so any candidate recorded `has_cv=False` is excluded from `to_fetch` permanently. The sharp case is not an applicant who genuinely attached no resume — it is a *transient* missing `download_url` from an archived, rate-limited, or partial GraphQL page, which silently blacklists that applicant from every future run with no retry and no signal. The shipped tool has the same hole via `no_cv.txt` → `processed_names`, but Task 6 made the manifest the sole authority, so it is now load-bearing. This repo already carries 429-backoff code, so rate-limited pages are not hypothetical.
+
+- [ ] **Step 0a: Write the failing tests for the no-CV revisit**
+
+Append to `tests/test_manifest.py`:
+
+```python
+def test_diff_revisits_a_no_cv_entry_once_a_resume_appears():
+    m = manifest.new_manifest({})
+    manifest.record(m, "id1", "Jane Smith", None, False, "2026-07-27")
+
+    todo = manifest.diff(m, [_api("Jane Smith", "id1")])
+
+    assert [c["legacy_id"] for c in todo] == ["id1"]
+
+
+def test_diff_does_not_revisit_a_no_cv_entry_that_still_has_no_resume():
+    m = manifest.new_manifest({})
+    manifest.record(m, "id1", "Jane Smith", None, False, "2026-07-27")
+
+    todo = manifest.diff(m, [_api("Jane Smith", "id1", has_url=False)])
+
+    assert todo == []
+
+
+def test_diff_never_revisits_an_entry_that_already_has_a_cv():
+    m = manifest.new_manifest({})
+    manifest.record(m, "id1", "Jane Smith", "Jane Smith", True, "2026-07-27")
+
+    assert manifest.diff(m, [_api("Jane Smith", "id1")]) == []
+```
+
+- [ ] **Step 0b: Run them to verify they fail**
+
+Run: `python3 -m pytest tests/test_manifest.py -k "revisit or never_revisits" -v`
+Expected: the first test FAILS (`assert [] == ['id1']`); the other two already pass under the current implementation.
+
+- [ ] **Step 0c: Amend `diff`**
+
+Replace `diff`'s body in `manifest.py` with:
+
+```python
+def diff(manifest: dict, api_candidates: list) -> list:
+    """API candidates that still need fetching, in API order.
+
+    Unknown candidates always qualify. A candidate already recorded WITHOUT a
+    CV also qualifies once the API starts offering a download_url: a missing
+    resume is often transient (archived page, rate limit, partial GraphQL
+    response), and keying on membership alone would blacklist that applicant
+    from every future run. An applicant who genuinely attached no resume keeps
+    returning no download_url, so this adds no repeated work for them.
+    """
+    known = manifest["candidates"]
+    out = []
+    for candidate in api_candidates:
+        entry = known.get(entry_key(candidate))
+        if entry is None:
+            out.append(candidate)
+        elif not entry.get("has_cv") and candidate.get("download_url"):
+            out.append(candidate)
+    return out
+```
+
+- [ ] **Step 0d: Run the full file**
+
+Run: `python3 -m pytest tests/test_manifest.py -v`
+Expected: PASS, 61 passed (58 + 3)
+
+- [ ] **Step 0e: Commit**
+
+```bash
+git add manifest.py tests/test_manifest.py
+git commit -m "fix(manifest): revisit a no-CV entry once the API offers a resume"
+```
+
 - [ ] **Step 1: Write the failing test for the guard helper**
 
 Append to `tests/test_manifest.py`:
@@ -1329,6 +1408,21 @@ Delete the anchor block:
 ```
 
 It is replaced by the finalise step below, which rewrites the file from the manifest instead of appending to it.
+
+- [ ] **Step 6b: Restore the `Skipped` counter for the backend path**
+
+**Amendment 3 (added 2026-07-27, during Task 6).** Task 6 deleted `download_cv_api`'s global-checkpoint early return, which was the only place the backend path incremented `self.stats['skipped']`. The frontend path still increments it at its own site, so after Task 6 a backend run — the mode HR_GUIDE.md tells HR to use — prints `Skipped: 0` in the end-of-run STATISTICS block while the per-job report correctly reports `skipped: already_processed`. That counter is the primary signal HR reads to confirm a re-run recognised the applicants she already had, so leaving it at zero undermines confidence in exactly the behavior this plan delivers.
+
+In `_download_all_candidates_api`, immediately after the `already_processed` computation Task 6 introduced (anchor: `already_processed = len(all_candidates_list) - len(to_fetch)`), add:
+
+```python
+        # The global-checkpoint early return in download_cv_api used to do
+        # this; Task 6 removed it, and without this line a backend run
+        # reports "Skipped: 0" while the per-job report shows the real count.
+        self.stats['skipped'] += already_processed
+```
+
+Verify afterwards that `grep -n "stats\['skipped'\] +=" indeed_downloader.py` returns two sites: this one and the pre-existing frontend one.
 
 - [ ] **Step 7: Add a finalise helper and call it on both exit paths**
 
@@ -1566,6 +1660,94 @@ with:
 
 The bare `except Exception: pass` is replaced deliberately: with the manifest in play, a failure here leaves `self.current_manifest` as `None` and every later call would fail confusingly.
 
+**Amendment 2 — the third call site (ruled 2026-07-27, during Task 5).** `_create_job_folder` has THREE callers, not two: `run_backend_single_job:1560`, `run_frontend_single_job:2400`, and `run_all_jobs:3798`. This step originally updated only the first and third. Left alone, `run_frontend_single_job` creates a folder whose manifest carries no job ID, so no later run can resolve to it by ID and that job's applicants split across folders — the exact bug this plan exists to fix, surviving in the fallback mode.
+
+`run_frontend_single_job` never parses the job ID at all, unlike the backend path. Give it the same extraction, then pass what it finds. Replace the anchor:
+
+```python
+            job_name = self.driver.execute_script("""
+                const el = document.querySelector('[data-testid="job-title"]') ||
+                           document.querySelector('h1');
+                return el ? el.textContent.trim() : 'Job';
+            """)
+            self._create_job_folder(job_name)
+            print(f"📁 Folder: {self.current_job_folder}")
+        except Exception:
+            pass
+```
+
+with:
+
+```python
+            job_name = self.driver.execute_script("""
+                const el = document.querySelector('[data-testid="job-title"]') ||
+                           document.querySelector('h1');
+                return el ? el.textContent.trim() : 'Job';
+            """)
+            # Frontend mode lands the user on a candidate page rather than the
+            # jobs table, so the URL shape is not guaranteed to carry either
+            # identifier. Harvest whatever is present and pass it through:
+            # with an id the manifest collapses this folder onto the same one
+            # the backend and all-jobs paths use; without one it still works,
+            # falling back to name-and-date resolution.
+            job_url = self.driver.current_url
+            employer_job_id = self._extract_job_id_from_url(job_url)
+            short_id = None
+            try:
+                params = parse_qs(urlparse(job_url).query)
+                candidate_short = params.get('legacyJobId', [None])[0] or params.get('id', [None])[0]
+                if candidate_short and candidate_short != '0':
+                    short_id = candidate_short
+            except (ValueError, KeyError, IndexError):
+                pass
+            self._create_job_folder(
+                job_name, None,
+                employer_job_id=employer_job_id,
+                short_id=short_id,
+            )
+            print(f"📁 Folder: {self.current_job_folder}")
+            if self.log:
+                self.log.event('frontend_single_job_ids', {
+                    'has_employer_job_id': bool(employer_job_id),
+                    'has_short_id': bool(short_id),
+                })
+        except Exception as e:
+            print(f"❌ Could not prepare the job folder: {e!r}")
+            if self.log:
+                self.log.event('frontend_single_job_folder_failed', {'err': repr(e)})
+            return
+```
+
+Do not assume either parameter resolves. On a `/candidates/view` profile URL the candidate's own `id=` is present and is NOT the job id, which is why `legacyJobId` is tried first and why the `log.event` records which identifiers were actually found — that telemetry is how we learn the real URL shape in frontend mode without guessing at it here.
+
+- [ ] **Step 4b: Correct the `stats.json` comment and prove it true**
+
+**Amendment 5 (added 2026-07-27, during Task 7 review).** Task 7 changed the `processed` value written to `stats.json` from a per-run count bounded by `total_recovered` to the cumulative manifest size, which includes stale and unmatched `_backfill:` entries. While `_find_existing_job_folders` still existed, that could classify a job as `[OK] complete` even when today's downloads all failed — `cv_count < total_recovered` reads `400 < 300` as False — and `[N] NewOnly` would then drop that job from the run. Deleting `_find_existing_job_folders` in Step 1 removes the only consumer, which is why this is a comment fix here rather than a value fix in Task 7.
+
+The comment Task 7 was told to write is false until this step lands. In `_finalize_job_manifest`, replace the anchor:
+
+```python
+        # stats.json stays for backward compatibility with older reports.
+        # Nothing reads it for a decision any more.
+```
+
+with:
+
+```python
+        # stats.json stays for the end-of-run report, which reads only
+        # total_announced and total_recovered (see _generate_report). The
+        # `processed` value is the cumulative manifest size — it counts stale
+        # and unmatched backfill entries, so it is NOT bounded by
+        # total_recovered and must never be compared against it.
+```
+
+- [ ] **Step 4c: Prove no consumer of `processed` survives**
+
+Run: `grep -n "get('processed'\|\[.processed.\]" indeed_downloader.py`
+Expected: no hit that reads the value back. `_save_job_stats`'s own parameter and its `'processed': processed` dict literal are writes, not reads, and may remain.
+
+If any read survives, stop and report it — the value is unbounded relative to `total_recovered` and any comparison between the two is a live misclassification.
+
 - [ ] **Step 5: Verify no references to the deleted methods remain**
 
 Run: `grep -n "_ask_skip_existing_jobs\|_find_existing_job_folders\|_load_job_checkpoint\|_save_job_checkpoint\|_create_candidate_folder\|current_job_is_existing" indeed_downloader.py`
@@ -1594,6 +1776,111 @@ git commit -m "refactor(rerun): drop the S/N/K prompt and the dead per-job check
 **Interfaces:**
 - Consumes: the full `manifest.py` surface.
 - Produces: no new interfaces.
+
+**Amendment 6 — an empty manifest must not block backfill (ruled 2026-07-27, during Task 8 review).** Frontend (Selenium) mode writes resumes to disk but never records them: `manifest_mod.record` and `manifest_mod.save` exist only on the API path. `_create_job_folder` still writes a manifest with `candidates: {}`, and on the next run `load()` *succeeds*, so the `if loaded is None` condition skips `backfill_from_disk` — the resumes on disk become permanently invisible and a later backend run diffs against `{}` and re-downloads all of them. The empty manifest makes recovery harder than having no manifest at all.
+
+The ruling is to close the dangerous half here and file the rest: **make backfill trigger whenever the manifest has no candidates**, and file frontend-side recording (`record` in `_download_cv_frontend`, `_finalize_job_manifest` at the end of `_download_all_candidates_frontend`) as separate work after merge.
+
+The condition goes in `manifest.py` as a named predicate rather than inline in `indeed_downloader.py`, both so it is testable — nothing under `tests/` imports `indeed_downloader` — and because it is identity/state logic, which this plan keeps in one module.
+
+- [ ] **Step 0a: Write the failing tests for the backfill predicate**
+
+Append to `tests/test_manifest.py`:
+
+```python
+def test_needs_backfill_is_true_when_there_is_no_manifest():
+    assert manifest.needs_backfill(None) is True
+
+
+def test_needs_backfill_is_true_when_the_manifest_has_no_candidates():
+    """Frontend mode writes resumes but no entries, so load() succeeds on an
+    empty manifest and would otherwise skip recovery forever."""
+    assert manifest.needs_backfill(manifest.new_manifest({"title": "Cook"})) is True
+
+
+def test_needs_backfill_is_false_once_entries_exist():
+    m = manifest.new_manifest({})
+    manifest.record(m, "id1", "Jane Smith", "Jane Smith", True, "2026-07-27")
+    assert manifest.needs_backfill(m) is False
+```
+
+- [ ] **Step 0b: Run them to verify they fail**
+
+Run: `python3 -m pytest tests/test_manifest.py -k needs_backfill -v`
+Expected: FAIL, `AttributeError: module 'manifest' has no attribute 'needs_backfill'`
+
+- [ ] **Step 0c: Add the predicate**
+
+Append to `manifest.py`:
+
+```python
+def needs_backfill(manifest: Optional[dict]) -> bool:
+    """True when a job folder's contents must be recovered from disk.
+
+    Covers two cases. No manifest at all is the obvious one. An EMPTY manifest
+    is the subtle one: the Selenium download path writes resumes without ever
+    calling record(), so its folders carry a manifest with no candidates, and
+    keying recovery on `load() is None` alone would leave those resumes
+    invisible forever — and a later diff would re-download every one of them.
+    A genuinely empty job folder backfills to empty, so triggering here costs
+    nothing when there is nothing to find.
+    """
+    return manifest is None or not manifest.get("candidates")
+```
+
+- [ ] **Step 0d: Use it, preserving run history**
+
+In `indeed_downloader.py`'s `_create_job_folder`, replace the anchor:
+
+```python
+        loaded = manifest_mod.load(job_folder)
+        if loaded is None:
+            loaded = manifest_mod.backfill_from_disk(job_folder, job_meta, today)
+```
+
+with:
+
+```python
+        loaded = manifest_mod.load(job_folder)
+        if manifest_mod.needs_backfill(loaded):
+            # Keep any run history the empty manifest already carried —
+            # backfill_from_disk starts from new_manifest and would drop it.
+            previous_runs = loaded.get('runs', []) if loaded else []
+            loaded = manifest_mod.backfill_from_disk(job_folder, job_meta, today)
+            loaded['runs'] = previous_runs + loaded['runs']
+```
+
+- [ ] **Step 0e: Guard the frontend id fallback (Amendment 7, ruled 2026-07-27)**
+
+Amendment 2's extraction falls back to `params.get('id')`. `run_frontend_single_job` tells HR to click a candidate before pressing Enter, so the URL is a candidate-profile URL where `id` is the CANDIDATE's id, not the job's. Persisting that into `job.short_id` is worse than persisting nothing: no id falls back to name-and-date resolution, but a WRONG id can also falsely match a different job's folder later and merge two jobs' applicants.
+
+Replace the anchor:
+
+```python
+                candidate_short = params.get('legacyJobId', [None])[0] or params.get('id', [None])[0]
+```
+
+with:
+
+```python
+                candidate_short = params.get('legacyJobId', [None])[0]
+                # `id` on a /candidates/view URL is the CANDIDATE's id, not the
+                # job's. Writing it into job.short_id would make this folder
+                # falsely match a different job later, so only trust `id` when
+                # we are not on a profile view.
+                if not candidate_short and '/candidates/view' not in urlparse(job_url).path:
+                    candidate_short = params.get('id', [None])[0]
+```
+
+- [ ] **Step 0f: Verify and commit**
+
+Run: `python3 -m pytest tests/test_manifest.py -v` — expected 67 passed (64 + 3)
+Run: `python3 -c "import ast; ast.parse(open('indeed_downloader.py').read()); print('syntax ok')"`
+
+```bash
+git add manifest.py tests/test_manifest.py indeed_downloader.py
+git commit -m "fix(rerun): backfill an empty manifest, and never trust a candidate id as a job id"
+```
 
 - [ ] **Step 1: Write the failing end-to-end test**
 
@@ -1812,11 +2099,29 @@ After Task 9, confirm the whole thing from a clean state:
 
 ```bash
 python3 -m pytest tests/ -v                      # expect 48 passed
-grep -c "rsplit('_', 2)" indeed_downloader.py    # expect 0
+grep -n "rsplit('_', 2)" indeed_downloader.py   # expect exactly 1 hit, inside a COMMENT
+# The one surviving mention is the comment in _download_all_candidates_api explaining
+# what the removed scan did and why it never matched. That is deliberate documentation
+# of the defect. Confirm no EXECUTABLE hit remains:
+grep -n "rsplit('_', 2)" indeed_downloader.py | grep -v "^\s*[0-9]*:\s*#"   # expect no output
 grep -c "import manifest as manifest_mod" indeed_downloader.py   # expect 1, and it must be top-level
 python3 -c "import ast; ast.parse(open('indeed_downloader.py').read()); print('ok')"
 ```
 
-Test totals accumulate as: Task 1 → 9, Task 2 → 15, Task 3 → 23, Task 4 → 32, Task 5 → 41, Task 6 → 41 (no new tests), Task 7 → 43, Task 8 → 44, Task 9 → 48. If a task's run reports a different number, a test was dropped or duplicated; fix it before moving on.
+Test totals, **corrected 2026-07-27 after Task 6** — the original projection did not account for the tests added by each task's review fix round, so every number from Task 2 onward was stale and implementers were reporting a "wrong" count against it. Actuals as committed:
+
+| after | tests | note |
+|---|---|---|
+| Task 1 | 9 | |
+| Task 2 | 15 → **18** | fix round added 3 (non-Latin key distinctness) |
+| Task 3 | 26 → **30** | fix round added 4 (per-character fold + invariant) |
+| Task 4 | 39 → **44** | fix round added 5 (case collision, allocate→record, ambiguity) |
+| Task 5 | 54 → **58** | fix round added 4 (ambiguity refusal, id precedence, date preference, missing root) |
+| Task 6 | **58** | wiring only, adds none |
+| Task 7 | 60 projected | +2 from the brief |
+| Task 8 | 61 projected | +1 from the brief |
+| Task 9 | 65 projected | +4 from the e2e harness |
+
+If a task's run reports a different number than the row above it plus its own new tests, a test was dropped or duplicated; fix it before moving on.
 
 The .exe rebuild (`Build Windows .exe` workflow, `workflow_dispatch`) is the last gate and needs a real Indeed session to test end to end. Ask Pawel before triggering it; the SHA-256 in HR_GUIDE.md:148 has to be updated from the build log and re-sent to HR with the new .exe.
