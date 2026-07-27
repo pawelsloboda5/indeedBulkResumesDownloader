@@ -594,3 +594,28 @@ def test_resolve_legacy_handles_a_missing_download_root(tmp_path):
     # FileNotFoundError on a missing folder. Degrading to None keeps the
     # first-ever run — no download root yet — off that path.
     assert manifest.resolve_legacy_folder_by_name(tmp_path / "nope", "Cook", None) is None
+
+
+def test_diff_revisits_a_no_cv_entry_once_a_resume_appears():
+    m = manifest.new_manifest({})
+    manifest.record(m, "id1", "Jane Smith", None, False, "2026-07-27")
+
+    todo = manifest.diff(m, [_api("Jane Smith", "id1")])
+
+    assert [c["legacy_id"] for c in todo] == ["id1"]
+
+
+def test_diff_does_not_revisit_a_no_cv_entry_that_still_has_no_resume():
+    m = manifest.new_manifest({})
+    manifest.record(m, "id1", "Jane Smith", None, False, "2026-07-27")
+
+    todo = manifest.diff(m, [_api("Jane Smith", "id1", has_url=False)])
+
+    assert todo == []
+
+
+def test_diff_never_revisits_an_entry_that_already_has_a_cv():
+    m = manifest.new_manifest({})
+    manifest.record(m, "id1", "Jane Smith", "Jane Smith", True, "2026-07-27")
+
+    assert manifest.diff(m, [_api("Jane Smith", "id1")]) == []

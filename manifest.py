@@ -218,9 +218,24 @@ def promote_backfilled(manifest: dict, api_candidates: list) -> int:
 
 
 def diff(manifest: dict, api_candidates: list) -> list:
-    """API candidates that aren't in the manifest yet, in API order."""
+    """API candidates that still need fetching, in API order.
+
+    Unknown candidates always qualify. A candidate already recorded WITHOUT a
+    CV also qualifies once the API starts offering a download_url: a missing
+    resume is often transient (archived page, rate limit, partial GraphQL
+    response), and keying on membership alone would blacklist that applicant
+    from every future run. An applicant who genuinely attached no resume keeps
+    returning no download_url, so this adds no repeated work for them.
+    """
     known = manifest["candidates"]
-    return [c for c in api_candidates if entry_key(c) not in known]
+    out = []
+    for candidate in api_candidates:
+        entry = known.get(entry_key(candidate))
+        if entry is None:
+            out.append(candidate)
+        elif not entry.get("has_cv") and candidate.get("download_url"):
+            out.append(candidate)
+    return out
 
 
 def mark_stale(manifest: dict, api_candidates: list, today: str) -> None:
