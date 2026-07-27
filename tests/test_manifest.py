@@ -279,3 +279,102 @@ def test_normalize_name_drops_underscores():
     assert manifest.normalize_name("Jane_Smith") == "janesmith"
     assert manifest.normalize_name("jane _ smith") == "jane smith"
     assert manifest.normalize_name("李伟_Smith") == "李伟smith"
+
+
+def test_allocate_folder_uses_the_sanitized_name(tmp_path):
+    m = manifest.new_manifest({})
+    folder = manifest.allocate_candidate_folder(tmp_path, m, "abc", "Jane O'Brien")
+    assert folder == tmp_path / "Jane OBrien"
+    assert folder.is_dir()
+
+
+def test_allocate_folder_suffixes_on_collision_with_a_different_id(tmp_path):
+    m = manifest.new_manifest({})
+    first = manifest.allocate_candidate_folder(tmp_path, m, "id1", "John Smith")
+    manifest.record(m, "id1", "John Smith", first.name, True, "2026-07-27")
+
+    second = manifest.allocate_candidate_folder(tmp_path, m, "id2", "John Smith")
+
+    assert first.name == "John Smith"
+    assert second.name == "John Smith (2)"
+    assert second.is_dir()
+
+
+def test_allocate_folder_is_stable_for_the_same_id(tmp_path):
+    m = manifest.new_manifest({})
+    first = manifest.allocate_candidate_folder(tmp_path, m, "id1", "John Smith")
+    manifest.record(m, "id1", "John Smith", first.name, True, "2026-07-27")
+
+    again = manifest.allocate_candidate_folder(tmp_path, m, "id1", "John Smith")
+
+    assert again == first
+
+
+def test_two_same_name_candidates_keep_separate_resumes(tmp_path):
+    m = manifest.new_manifest({})
+    a = manifest.allocate_candidate_folder(tmp_path, m, "id1", "John Smith")
+    (a / "resume.pdf").write_bytes(b"A" * 5000)
+    manifest.record(m, "id1", "John Smith", a.name, True, "2026-07-27")
+
+    b = manifest.allocate_candidate_folder(tmp_path, m, "id2", "John Smith")
+    (b / "resume.pdf").write_bytes(b"B" * 5000)
+    manifest.record(m, "id2", "John Smith", b.name, True, "2026-07-27")
+
+    assert (a / "resume.pdf").read_bytes()[:1] == b"A"
+    assert (b / "resume.pdf").read_bytes()[:1] == b"B"
+
+
+def test_record_preserves_first_seen_on_update():
+    m = manifest.new_manifest({})
+    manifest.record(m, "id1", "Jane", "Jane", False, "2026-07-27")
+    manifest.record(m, "id1", "Jane", "Jane", True, "2026-07-30")
+
+    entry = m["candidates"]["id1"]
+    assert entry["first_seen"] == "2026-07-27"
+    assert entry["last_seen"] == "2026-07-30"
+    assert entry["has_cv"] is True
+
+
+def test_write_no_cv_is_byte_identical_across_runs(tmp_path):
+    m = manifest.new_manifest({})
+    manifest.record(m, "id1", "Bob Jones", None, False, "2026-07-27")
+    manifest.record(m, "id2", "Jane Smith", "Jane Smith", True, "2026-07-27")
+
+    manifest.write_no_cv(tmp_path, m)
+    first = (tmp_path / "no_cv.txt").read_bytes()
+    manifest.write_no_cv(tmp_path, m)
+    second = (tmp_path / "no_cv.txt").read_bytes()
+
+    assert first == second
+    assert first.decode("utf-8") == "Bob Jones\n"
+
+
+def test_write_no_cv_removes_the_file_when_everyone_has_a_cv(tmp_path):
+    (tmp_path / "no_cv.txt").write_text("Stale Name\n", encoding="utf-8")
+    m = manifest.new_manifest({})
+    manifest.record(m, "id1", "Jane Smith", "Jane Smith", True, "2026-07-27")
+
+    manifest.write_no_cv(tmp_path, m)
+
+    assert not (tmp_path / "no_cv.txt").exists()
+
+
+def test_find_key_by_name_locates_an_entry_keyed_on_a_legacy_id():
+    m = manifest.new_manifest({})
+    manifest.record(m, "abc123", "Renée Dupont", "Renee Dupont", True, "2026-07-27")
+
+    assert manifest.find_key_by_name(m, "renee dupont") == "abc123"
+    assert manifest.find_key_by_name(m, "Someone Else") is None
+
+
+def test_find_key_by_name_lets_the_app_data_pass_reuse_the_cv_folder(tmp_path):
+    """The CV download keys on the legacy id; the app-data pass sees only a
+    name. Both must resolve to the same folder or the Q&A files land apart."""
+    m = manifest.new_manifest({})
+    cv_folder = manifest.allocate_candidate_folder(tmp_path, m, "abc123", "John Smith")
+    manifest.record(m, "abc123", "John Smith", cv_folder.name, True, "2026-07-27")
+
+    key = manifest.find_key_by_name(m, "John Smith") or "_nokey:john smith"
+    app_data_folder = manifest.allocate_candidate_folder(tmp_path, m, key, "John Smith")
+
+    assert app_data_folder == cv_folder

@@ -236,3 +236,86 @@ def mark_stale(manifest: dict, api_candidates: list, today: str) -> None:
             entry["stale"] = False
         else:
             entry["stale"] = True
+
+
+def allocate_candidate_folder(job_folder: Path, manifest: dict, key: str, name: str) -> Path:
+    """Return (and create) this candidate's folder inside the job folder.
+
+    Folders are named for humans, so two different people named John Smith
+    would collide. The manifest knows which folder belongs to which ID, so
+    the second one gets " (2)" instead of silently overwriting the first.
+    """
+    existing = manifest["candidates"].get(key, {}).get("folder")
+    if existing:
+        folder = Path(job_folder) / existing
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder
+
+    taken = {
+        entry["folder"]
+        for other_key, entry in manifest["candidates"].items()
+        if other_key != key and entry.get("folder")
+    }
+    base = sanitize_folder_name(name)
+    chosen, n = base, 2
+    while chosen in taken:
+        chosen = f"{base} ({n})"
+        n += 1
+
+    folder = Path(job_folder) / chosen
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def record(manifest: dict, key: str, name: str, folder: Optional[str],
+           has_cv: bool, today: str) -> None:
+    """Insert or update one candidate. Preserves first_seen across updates."""
+    existing = manifest["candidates"].get(key)
+    manifest["candidates"][key] = {
+        "name": name,
+        "folder": folder,
+        "has_cv": has_cv,
+        "stale": False,
+        "first_seen": existing["first_seen"] if existing else today,
+        "last_seen": today,
+    }
+
+
+def write_no_cv(job_folder: Path, manifest: dict) -> None:
+    """Regenerate no_cv.txt from the manifest.
+
+    Rewritten rather than appended: the old append-per-run behaviour
+    duplicated every name on each pass and inflated the candidate counts
+    derived from the file. Sorted so two runs over the same data produce
+    byte-identical output.
+    """
+    path = Path(job_folder) / NO_CV_FILENAME
+    names = sorted(
+        entry["name"] for entry in manifest["candidates"].values()
+        if not entry.get("has_cv")
+    )
+    if not names:
+        if path.exists():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        return
+    path.write_text("\n".join(names) + "\n", encoding="utf-8")
+
+
+def find_key_by_name(manifest: dict, name: str) -> Optional[str]:
+    """Find an existing entry's key by matching on normalized display name.
+
+    Only download_cv_api holds an API candidate dict with a legacyID. The
+    app-data pass and the Selenium path see a display name only, and must
+    land in the SAME folder the resume went to — otherwise the screener Q&A
+    files end up in a second folder for the same person.
+    """
+    target = normalize_name(name)
+    if not target:
+        return None
+    for key, entry in manifest["candidates"].items():
+        if normalize_name(entry.get("name", "")) == target:
+            return key
+    return None
