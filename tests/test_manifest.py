@@ -377,7 +377,14 @@ def test_write_no_cv_is_byte_identical_across_runs(tmp_path):
     second = (tmp_path / "no_cv.txt").read_bytes()
 
     assert first == second
-    assert first.decode("utf-8") == "Bob Jones\n"
+    # Assert the NAMES, not the line terminator. write_no_cv writes in text
+    # mode on purpose, so no_cv.txt lands with the platform's own line
+    # endings — CRLF on the Windows machine where HR opens it in Notepad.
+    # Both read paths cope (backfill_from_disk splitlines(), the report's
+    # line.strip()), so that output is right for its audience. Hardcoding
+    # "\n" here fails on the Windows CI runner and invites a "fix" to the
+    # writer, which is the wrong side of this.
+    assert first.decode("utf-8").splitlines() == ["Bob Jones"]
 
 
 def test_write_no_cv_removes_the_file_when_everyone_has_a_cv(tmp_path):

@@ -115,7 +115,13 @@ def test_no_cv_file_does_not_grow_across_runs(tmp_path):
     _run_pass(job_folder, {"title": "Cook"}, api, "2026-07-30")
     second = (job_folder / "no_cv.txt").read_bytes()
 
-    assert first == second == b"No CV\n"
+    # Byte-identity across the two runs is the subject: the old code appended,
+    # so the file grew on every pass. The line terminator is deliberately
+    # platform-native — write_no_cv writes in text mode so no_cv.txt opens
+    # cleanly in Notepad on HR's Windows machine — so the content assertion
+    # goes through splitlines() rather than pinning "\n" and breaking there.
+    assert first == second
+    assert first.decode("utf-8").splitlines() == ["No CV"]
 
 
 def test_recovering_an_empty_manifest_keeps_the_job_identity_and_history(tmp_path):
