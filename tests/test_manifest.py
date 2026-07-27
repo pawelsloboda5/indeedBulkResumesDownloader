@@ -14,6 +14,23 @@ def test_normalize_name_matches_across_representations():
     assert manifest.normalize_name("Renée Dupont") == manifest.normalize_name("renee dupont")
 
 
+def test_normalize_name_keeps_non_latin_names_distinct():
+    # The ASCII fold empties these entirely. Without a fallback every non-Latin
+    # name collides onto one key, which mis-binds two applicants downstream.
+    li = manifest.normalize_name("李伟")
+    wang = manifest.normalize_name("王芳")
+    assert li != ""
+    assert wang != ""
+    assert li != wang
+
+
+def test_normalize_name_fallback_leaves_latin_names_alone():
+    # Accented Latin still folds to ASCII — proof the fallback did not engage
+    # and quietly start keying on the raw spelling.
+    assert manifest.normalize_name("Renée Dupont") == "renee dupont"
+    assert manifest.normalize_name("Jane Smith") == "jane smith"
+
+
 def test_sanitize_folder_name_keeps_readable_characters():
     assert manifest.sanitize_folder_name("Jean-Luc O'Connor") == "Jean-Luc OConnor"
     assert manifest.sanitize_folder_name("!!!") == "unknown"
@@ -128,3 +145,17 @@ def test_backfill_on_empty_folder_yields_empty_manifest(tmp_path):
     m = manifest.backfill_from_disk(tmp_path, {"title": "Cook"}, "2026-07-27")
     assert m["candidates"] == {}
     assert m["job"]["title"] == "Cook"
+
+
+def test_backfill_keeps_non_latin_candidates_distinct(tmp_path):
+    _make_candidate(tmp_path, "李伟", 5000)
+    _make_candidate(tmp_path, "王芳", 5000)
+
+    m = manifest.backfill_from_disk(tmp_path, {}, "2026-07-27")
+
+    # Two people on disk must stay two entries. Collapsing them onto the bare
+    # prefix is what lets a later promotion bind one applicant's legacyID to
+    # the other applicant's folder.
+    assert len(m["candidates"]) == 2
+    assert {e["folder"] for e in m["candidates"].values()} == {"李伟", "王芳"}
+    assert manifest.BACKFILL_PREFIX not in m["candidates"]

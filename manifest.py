@@ -38,10 +38,22 @@ def normalize_name(s: str) -> str:
     """Aggressive form used only for MATCHING two spellings of one person.
 
     Not for naming folders — see sanitize_folder_name for that.
+
+    The ASCII fold below erases any name written without Latin characters:
+    Cyrillic, Arabic, CJK, Greek and Hebrew all reduce to "". Every such name
+    would then share one key, collapsing two applicants into a single manifest
+    entry and letting a later promotion bind one person's Indeed ID to another
+    person's folder. So when the fold comes back empty we key on the raw name
+    instead, lowercased and whitespace-collapsed — still deterministic and
+    stable across runs, but distinct per person.
     """
-    s = unicodedata.normalize("NFKD", s or "").encode("ASCII", "ignore").decode("ASCII")
-    s = re.sub(r"[^a-z0-9\s]", "", s.lower())
-    return re.sub(r"\s+", " ", s).strip()
+    raw = s or ""
+    folded = unicodedata.normalize("NFKD", raw).encode("ASCII", "ignore").decode("ASCII")
+    folded = re.sub(r"[^a-z0-9\s]", "", folded.lower())
+    folded = re.sub(r"\s+", " ", folded).strip()
+    if folded:
+        return folded
+    return re.sub(r"\s+", " ", raw.lower()).strip()
 
 
 def sanitize_folder_name(name: str) -> str:
