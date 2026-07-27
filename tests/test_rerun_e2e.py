@@ -20,10 +20,22 @@ def _api(name, legacy_id, has_cv=True):
 
 
 def _run_pass(job_folder: Path, job: dict, api_candidates: list, today: str):
-    """Mirror the sequence _download_all_candidates_api performs."""
+    """Mirror the sequence _download_all_candidates_api performs.
+
+    The backfill block mirrors _create_job_folder. Nothing under tests/
+    imports indeed_downloader, so this helper is the only executable record
+    of that sequence — keep the two in step. A divergence here passes while
+    the real path is broken, which is exactly how the job-block loss this
+    file now guards against went unnoticed.
+    """
     loaded = manifest.load(job_folder)
-    if loaded is None:
+    if manifest.needs_backfill(loaded):
+        previous_runs = loaded.get("runs", []) if loaded else []
+        previous_job = dict(loaded.get("job") or {}) if loaded else {}
         loaded = manifest.backfill_from_disk(job_folder, job, today)
+        loaded["runs"] = previous_runs + loaded["runs"]
+        previous_job.update({k: v for k, v in job.items() if v})
+        loaded["job"] = previous_job
 
     manifest.promote_backfilled(loaded, api_candidates)
     to_fetch = manifest.diff(loaded, api_candidates)
@@ -104,3 +116,51 @@ def test_no_cv_file_does_not_grow_across_runs(tmp_path):
     second = (job_folder / "no_cv.txt").read_bytes()
 
     assert first == second == b"No CV\n"
+
+
+def test_recovering_an_empty_manifest_keeps_the_job_identity_and_history(tmp_path):
+    """A second frontend run must not erase what the first one recorded.
+
+    Frontend mode writes resumes but never calls record(), so its folder
+    carries a manifest with no candidates — which is the whole reason
+    recovery has to trigger on an EMPTY manifest and not just a missing one.
+
+    The second frontend run starts from a /candidates/view URL, so it has no
+    identifiers to offer: there is no employerJobId on a profile URL, and the
+    `id` there belongs to the CANDIDATE, so it is refused. Recovery must
+    therefore MERGE onto the stored job block rather than replace it.
+    Replacing drops short_id, and resolve_job_folder matches on ids alone, so
+    the folder would fall back to name-and-date matching permanently — the
+    split-folder failure the id-based resolver exists to prevent.
+    """
+    job_folder = tmp_path / "Cook"
+    job_folder.mkdir()
+    for i in range(3):
+        person = job_folder / f"Person {i:02d}"
+        person.mkdir()
+        (person / "resume.pdf").write_bytes(b"old" * 2000)
+
+    # What a first frontend run leaves behind: the ids it harvested from the
+    # job-list URL and a run record, but no candidate entries at all.
+    seeded = manifest.new_manifest({"title": "Cook", "posted_date": "",
+                                    "employer_job_id": "", "short_id": "33723070"})
+    seeded["runs"] = [{"at": "2026-07-27T09:00:00", "announced": 3,
+                       "fetched": 3, "new": 3}]
+    manifest.save(job_folder, seeded)
+
+    id_less = {"title": "Cook", "posted_date": "",
+               "employer_job_id": "", "short_id": ""}
+    api = [_api(f"Person {i:02d}", f"id{i:02d}") for i in range(3)]
+    loaded, to_fetch = _run_pass(job_folder, id_less, api, "2026-07-30")
+
+    # The resumes already on disk were recovered, not re-downloaded.
+    assert to_fetch == []
+    assert len(loaded["candidates"]) == 3
+    assert (job_folder / "Person 00" / "resume.pdf").read_bytes()[:3] == b"old"
+
+    # The identity and the history survived the recovery.
+    assert loaded["job"]["short_id"] == "33723070"
+    assert len(loaded["runs"]) == 1
+
+    # Which is what keeps this folder findable by id on every later run.
+    assert manifest.resolve_job_folder(tmp_path, None, "33723070") == job_folder

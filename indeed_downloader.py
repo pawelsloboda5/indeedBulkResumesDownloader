@@ -1210,11 +1210,26 @@ class IndeedDownloader:
 
         loaded = manifest_mod.load(job_folder)
         if manifest_mod.needs_backfill(loaded):
-            # Keep any run history the empty manifest already carried —
-            # backfill_from_disk starts from new_manifest and would drop it.
+            # Keep the run history and the job identity the empty manifest
+            # already carried — backfill_from_disk starts from new_manifest,
+            # which REPLACES the job block wholesale rather than merging it.
+            #
+            # The job block matters most: a frontend re-run lands on a
+            # /candidates/view URL, so job_meta carries '' for both ids (the
+            # profile-view guard below correctly refuses the candidate's id).
+            # Replacing would erase the short_id an earlier run stored, and
+            # resolve_job_folder matches on ids alone — this folder would
+            # silently drop to name-and-date matching forever after.
+            #
+            # Hence merge, stored block as the base, and let only non-empty
+            # job_meta values overwrite: a later run holding real identifiers
+            # can still upgrade the block, an id-less one cannot erase it.
             previous_runs = loaded.get('runs', []) if loaded else []
+            previous_job = dict(loaded.get('job') or {}) if loaded else {}
             loaded = manifest_mod.backfill_from_disk(job_folder, job_meta, today)
             loaded['runs'] = previous_runs + loaded['runs']
+            previous_job.update({k: v for k, v in job_meta.items() if v})
+            loaded['job'] = previous_job
             recovered = len(loaded['candidates'])
             if recovered:
                 print(f"   Recovered {recovered} existing candidates from disk")
