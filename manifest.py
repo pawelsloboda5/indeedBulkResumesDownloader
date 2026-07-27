@@ -34,26 +34,50 @@ BACKFILL_PREFIX = "_backfill:"   # recovered from disk, awaiting promotion
 NOKEY_PREFIX = "_nokey:"         # API returned the candidate without an ID
 
 
+def _fold_char(ch: str) -> str:
+    """NFKD-fold one character to ASCII, or keep it as-is when it has no fold.
+
+    Folding a whole string at once erases every name written without Latin
+    characters — Cyrillic, Arabic, CJK, Greek and Hebrew all reduce to "".
+    Per character, é→e and ﬁ→fi as before, while 李 and А survive intact.
+    """
+    ascii_form = unicodedata.normalize("NFKD", ch).encode("ASCII", "ignore").decode("ASCII")
+    return ascii_form or ch
+
+
 def normalize_name(s: str) -> str:
     """Aggressive form used only for MATCHING two spellings of one person.
 
     Not for naming folders — see sanitize_folder_name for that.
 
-    The ASCII fold below erases any name written without Latin characters:
-    Cyrillic, Arabic, CJK, Greek and Hebrew all reduce to "". Every such name
-    would then share one key, collapsing two applicants into a single manifest
-    entry and letting a later promotion bind one person's Indeed ID to another
-    person's folder. So when the fold comes back empty we key on the raw name
-    instead, lowercased and whitespace-collapsed — still deterministic and
-    stable across runs, but distinct per person.
+    Promotion compares a normalized API name against the normalized name of a
+    folder on disk, and that folder was written by sanitize_folder_name. So the
+    invariant this has to hold is:
+
+        normalize_name(sanitize_folder_name(x)) == normalize_name(x)
+
+    Punctuation is what makes that easy to break. sanitize_folder_name drops
+    everything non-alphanumeric, so `阿卜杜拉·穆罕默德` lands on disk as
+    `阿卜杜拉穆罕默德`; if the interpunct survives normalization on the API side
+    the two never meet, promotion fails, and that applicant re-downloads on
+    every run, silently, forever. Hence the Unicode-aware class below: it keeps
+    letters and digits in ANY script and drops the rest. `_` is dropped
+    explicitly because `re` counts it as a word character while the older
+    ASCII-only class did not, and ASCII behavior must not shift.
+
+    Folding per character — rather than folding the whole string and falling
+    back to the raw name when that came back empty — is also what keeps two
+    non-Latin names distinct, including names that MIX scripts, where a
+    whole-string fold leaves only the Latin fragment and keys `李伟 Smith` and
+    `王芳 Smith` both on "smith".
+
+    Accepted side effect: ß, Æ, Ø and Þ have no NFKD ASCII form, so they now
+    survive rather than being dropped — `Straße` keys `straße`, not `strae`.
+    Matching is unaffected because both sides change together.
     """
-    raw = s or ""
-    folded = unicodedata.normalize("NFKD", raw).encode("ASCII", "ignore").decode("ASCII")
-    folded = re.sub(r"[^a-z0-9\s]", "", folded.lower())
-    folded = re.sub(r"\s+", " ", folded).strip()
-    if folded:
-        return folded
-    return re.sub(r"\s+", " ", raw.lower()).strip()
+    folded = "".join(_fold_char(c) for c in (s or ""))
+    stripped = re.sub(r"[^\w\s]|_", "", folded.lower())
+    return re.sub(r"\s+", " ", stripped).strip()
 
 
 def sanitize_folder_name(name: str) -> str:

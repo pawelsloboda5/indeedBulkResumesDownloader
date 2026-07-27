@@ -240,3 +240,42 @@ def test_mark_stale_flags_candidates_the_api_stopped_returning():
     assert m["candidates"]["a"]["last_seen"] == "2026-07-30"
     assert m["candidates"]["b"]["stale"] is True
     assert m["candidates"]["b"]["last_seen"] == "old"
+
+
+def test_normalize_name_survives_sanitize_folder_name():
+    # The invariant promotion rests on. One side of the match is an API name;
+    # the other is a folder that name already went through sanitize_folder_name
+    # to produce. Any character sanitize drops must normalize away here too, or
+    # the two sides never meet and the applicant re-downloads every run.
+    for name in ("阿卜杜拉·穆罕默德", "Анна, Мария", "李伟 ☆",
+                 "Jane O'Brien", "Jean-Luc O'Connor", "Renée Dupont"):
+        assert manifest.normalize_name(manifest.sanitize_folder_name(name)) == \
+            manifest.normalize_name(name), name
+
+
+def test_promote_matches_a_punctuated_non_latin_name(tmp_path):
+    # The interpunct cannot survive in a folder name, so the folder and the API
+    # name differ by a character. They must still normalize to one key.
+    assert manifest.sanitize_folder_name("阿卜杜拉·穆罕默德") == "阿卜杜拉穆罕默德"
+    _make_candidate(tmp_path, "阿卜杜拉穆罕默德", 5000)
+    m = manifest.backfill_from_disk(tmp_path, {}, "2026-07-27")
+
+    assert manifest.promote_backfilled(m, [_api("阿卜杜拉·穆罕默德", "id9")]) == 1
+    assert m["candidates"]["id9"]["folder"] == "阿卜杜拉穆罕默德"
+    assert m["candidates"]["id9"]["has_cv"] is True
+
+
+def test_normalize_name_keeps_mixed_script_names_distinct():
+    # A whole-string ASCII fold erases the CJK and leaves both of these keyed
+    # on "smith", which binds one applicant's legacyID to the other's folder.
+    assert manifest.normalize_name("李伟 Smith") == "李伟 smith"
+    assert manifest.normalize_name("王芳 Smith") == "王芳 smith"
+
+
+def test_normalize_name_drops_underscores():
+    # Underscores were dropped by the old ASCII-only character class, and the
+    # Unicode-aware class that replaces it counts "_" as a word character.
+    # It has to keep dropping them, in any script.
+    assert manifest.normalize_name("Jane_Smith") == "janesmith"
+    assert manifest.normalize_name("jane _ smith") == "jane smith"
+    assert manifest.normalize_name("李伟_Smith") == "李伟smith"
