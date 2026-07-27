@@ -238,12 +238,37 @@ def mark_stale(manifest: dict, api_candidates: list, today: str) -> None:
             entry["stale"] = True
 
 
+def _folder_key(folder: str) -> str:
+    """Comparison form for a folder name — what the FILESYSTEM considers equal.
+
+    Two folder strings can differ and still be one directory. NTFS and APFS
+    both resolve names case-insensitively, and APFS normalizes Unicode as
+    well, so `John Smith`/`john smith` and the NFC/NFD spellings of `José`
+    each address a single folder. Comparing raw strings handed the second
+    applicant the first one's directory and let mkdir(exist_ok=True) overwrite
+    their resume.
+    """
+    return unicodedata.normalize("NFC", folder or "").casefold()
+
+
 def allocate_candidate_folder(job_folder: Path, manifest: dict, key: str, name: str) -> Path:
     """Return (and create) this candidate's folder inside the job folder.
 
     Folders are named for humans, so two different people named John Smith
     would collide. The manifest knows which folder belongs to which ID, so
     the second one gets " (2)" instead of silently overwriting the first.
+
+    Collision is tested on _folder_key, not on the raw string, because the
+    filesystem is the thing that decides whether two names are one directory.
+    The folder itself keeps the applicant's own spelling — only the test folds.
+
+    CALLER CONTRACT — allocate, then record, before allocating the next
+    candidate. This function reserves nothing: the suffix is derived from the
+    manifest, and the manifest only learns a folder exists when record()
+    writes it. Two allocations with no record between them read the same
+    unchanged manifest and return the SAME path, which is exactly the
+    overwrite this function exists to prevent. A caller that skips record()
+    when a download fails reopens the bug for the next candidate.
     """
     existing = manifest["candidates"].get(key, {}).get("folder")
     if existing:
@@ -252,13 +277,13 @@ def allocate_candidate_folder(job_folder: Path, manifest: dict, key: str, name: 
         return folder
 
     taken = {
-        entry["folder"]
+        _folder_key(entry["folder"])
         for other_key, entry in manifest["candidates"].items()
         if other_key != key and entry.get("folder")
     }
     base = sanitize_folder_name(name)
     chosen, n = base, 2
-    while chosen in taken:
+    while _folder_key(chosen) in taken:
         chosen = f"{base} ({n})"
         n += 1
 
@@ -311,11 +336,21 @@ def find_key_by_name(manifest: dict, name: str) -> Optional[str]:
     app-data pass and the Selenium path see a display name only, and must
     land in the SAME folder the resume went to — otherwise the screener Q&A
     files end up in a second folder for the same person.
+
+    Returns None when the name is AMBIGUOUS as well as when it is unknown.
+    Two genuine John Smiths already have two separate, correct folders;
+    guessing the first would write the second applicant's Q&A into the first
+    one's folder and corrupt a folder that was already right. The caller
+    falls through to its own _nokey: path instead, so the worst case is a
+    spurious extra folder rather than a destroyed one.
     """
     target = normalize_name(name)
     if not target:
         return None
-    for key, entry in manifest["candidates"].items():
-        if normalize_name(entry.get("name", "")) == target:
-            return key
-    return None
+    matches = [
+        key for key, entry in manifest["candidates"].items()
+        if normalize_name(entry.get("name", "")) == target
+    ]
+    if len(matches) != 1:
+        return None
+    return matches[0]

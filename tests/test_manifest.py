@@ -1,4 +1,5 @@
 import json
+import unicodedata
 from pathlib import Path
 from typing import Optional
 
@@ -378,3 +379,87 @@ def test_find_key_by_name_lets_the_app_data_pass_reuse_the_cv_folder(tmp_path):
     app_data_folder = manifest.allocate_candidate_folder(tmp_path, m, key, "John Smith")
 
     assert app_data_folder == cv_folder
+
+
+def test_allocate_folder_suffixes_when_names_differ_only_by_case(tmp_path):
+    # NTFS and APFS both resolve names case-insensitively, so "John Smith" and
+    # "john smith" are ONE directory. Comparing raw strings let the second
+    # applicant take the first's folder and overwrite their resume — and
+    # because both keys then hit the `existing` branch on every later run, the
+    # state stayed wedged instead of self-correcting.
+    m = manifest.new_manifest({})
+    first = manifest.allocate_candidate_folder(tmp_path, m, "id1", "John Smith")
+    (first / "resume.pdf").write_bytes(b"A" * 5000)
+    manifest.record(m, "id1", "John Smith", first.name, True, "2026-07-27")
+
+    second = manifest.allocate_candidate_folder(tmp_path, m, "id2", "john smith")
+    (second / "resume.pdf").write_bytes(b"B" * 5000)
+    manifest.record(m, "id2", "john smith", second.name, True, "2026-07-27")
+
+    # The folder keeps the applicant's own spelling; only the collision test folds.
+    assert second.name == "john smith (2)"
+    assert (first / "resume.pdf").read_bytes()[:1] == b"A"
+    assert (second / "resume.pdf").read_bytes()[:1] == b"B"
+
+
+def test_allocate_folder_treats_nfc_and_nfd_spellings_as_one_folder(tmp_path):
+    # backfill_from_disk records folder names straight off the filesystem, and
+    # APFS hands back decomposed (NFD) spellings while the Indeed API sends
+    # composed (NFC) ones. Both address the same directory, so the second
+    # candidate has to take a suffix.
+    nfd = unicodedata.normalize("NFD", "José Ruiz")
+    nfc = unicodedata.normalize("NFC", "José Ruiz")
+    assert nfd != nfc
+
+    m = manifest.new_manifest({})
+    manifest.record(m, "id1", nfd, nfd, True, "2026-07-27")
+
+    second = manifest.allocate_candidate_folder(tmp_path, m, "id2", nfc)
+
+    assert second.name == nfc + " (2)"
+    assert second.is_dir()
+
+
+def test_allocation_is_not_reserved_until_record_is_called(tmp_path):
+    # allocate_candidate_folder derives the suffix from the manifest, and the
+    # manifest only learns about a folder when record() writes it. Pinning the
+    # consequence: a caller that allocates twice without recording in between
+    # hands two applicants one directory. Task 6 must record before allocating
+    # the next candidate, including when the download in between failed.
+    m = manifest.new_manifest({})
+
+    a = manifest.allocate_candidate_folder(tmp_path, m, "id1", "John Smith")
+    b = manifest.allocate_candidate_folder(tmp_path, m, "id2", "John Smith")
+    assert a == b == tmp_path / "John Smith"
+
+    manifest.record(m, "id1", "John Smith", a.name, True, "2026-07-27")
+
+    c = manifest.allocate_candidate_folder(tmp_path, m, "id2", "John Smith")
+    d = manifest.allocate_candidate_folder(tmp_path, m, "id3", "John Smith")
+    assert c == d == tmp_path / "John Smith (2)"
+
+
+def test_find_key_by_name_returns_none_when_the_name_is_ambiguous():
+    # Two genuine John Smiths already have separate, correct folders. Guessing
+    # the first one would write the second applicant's screener Q&A into the
+    # first's folder — corrupting a folder that was already right. Returning
+    # None lets the caller fall through to its own _nokey: path instead.
+    m = manifest.new_manifest({})
+    manifest.record(m, "id1", "John Smith", "John Smith", True, "2026-07-27")
+    manifest.record(m, "id2", "John Smith", "John Smith (2)", True, "2026-07-27")
+
+    assert manifest.find_key_by_name(m, "John Smith") is None
+
+    # An unambiguous name still resolves — that is the whole point of the lookup.
+    manifest.record(m, "id3", "Jane Doe", "Jane Doe", True, "2026-07-27")
+    assert manifest.find_key_by_name(m, "Jane Doe") == "id3"
+
+
+def test_find_key_by_name_counts_case_variants_as_the_same_ambiguous_name():
+    # normalize_name folds case, so these are two spellings of one name as far
+    # as the lookup is concerned. They are still two different applicants.
+    m = manifest.new_manifest({})
+    manifest.record(m, "id1", "John Smith", "John Smith", True, "2026-07-27")
+    manifest.record(m, "id2", "john smith", "john smith (2)", True, "2026-07-27")
+
+    assert manifest.find_key_by_name(m, "John Smith") is None
