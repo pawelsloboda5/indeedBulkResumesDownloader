@@ -1744,6 +1744,30 @@ class IndeedDownloader:
 
         return list(all_candidates.values()), total_announced
 
+    def _finalize_job_manifest(self, total_announced: int, total_recovered: int,
+                               all_candidates_list: list, downloaded: int) -> None:
+        """Persist manifest, regenerate no_cv.txt, append the run record.
+
+        Called on every path that completes a job, including the one where
+        there was nothing new to fetch.
+        """
+        if not self.current_job_folder or self.current_manifest is None:
+            return
+        today = time.strftime('%Y-%m-%d')
+        manifest_mod.mark_stale(self.current_manifest, all_candidates_list, today)
+        self.current_manifest['runs'].append({
+            'at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+            'announced': total_announced,
+            'fetched': total_recovered,
+            'new': downloaded,
+        })
+        manifest_mod.save(self.current_job_folder, self.current_manifest)
+        manifest_mod.write_no_cv(self.current_job_folder, self.current_manifest)
+        # stats.json stays for backward compatibility with older reports.
+        # Nothing reads it for a decision any more.
+        self._save_job_stats(total_announced, total_recovered,
+                             len(self.current_manifest['candidates']))
+
     def _download_all_candidates_api(self, job_total_candidates: int = 0):
         """Download all candidates via API with multiple passes to bypass 3000 limit
 
@@ -1848,6 +1872,19 @@ class IndeedDownloader:
 
         print(f"\n   Total expected: {total_expected} | Fetched: {len(all_candidates_list)}")
 
+        if manifest_mod.should_abort_empty_api(self.current_manifest, len(all_candidates_list)):
+            on_disk = len(self.current_manifest['candidates'])
+            print(f"   API returned 0 candidates but {on_disk} are already on disk.")
+            print(f"   Leaving this job untouched — usually an expired session or a rate limit.")
+            print(f"   Log in again in the Chrome window and re-run this job.")
+            self.stats['archived'] += 1
+            if self.log:
+                self.log.event('empty_api_guard_tripped', {
+                    'job_folder': str(self.current_job_folder),
+                    'manifest_entries': on_disk,
+                })
+            return
+
         if len(all_candidates_list) == 0 and total_expected > 0:
             print(f"   No candidates fetched - job too old or data archived")
             self.stats['archived'] += 1
@@ -1871,6 +1908,11 @@ class IndeedDownloader:
         to_fetch = manifest_mod.diff(self.current_manifest, all_candidates_list)
         already_processed = len(all_candidates_list) - len(to_fetch)
 
+        # The global-checkpoint early return in download_cv_api used to do
+        # this; Task 6 removed it, and without this line a backend run
+        # reports "Skipped: 0" while the per-job report shows the real count.
+        self.stats['skipped'] += already_processed
+
         candidates_with_cv = [c for c in to_fetch if c['download_url']]
         candidates_no_cv = [c for c in to_fetch if not c['download_url']]
 
@@ -1882,14 +1924,6 @@ class IndeedDownloader:
         if candidates_no_cv:
             print(f"   {len(candidates_no_cv)} new candidates without a CV")
 
-        # Save candidates without CV to no_cv.txt
-        if candidates_no_cv and self.current_job_folder:
-            no_cv_file = self.current_job_folder / 'no_cv.txt'
-            with open(no_cv_file, 'a', encoding='utf-8') as f:
-                for c in candidates_no_cv:
-                    f.write(c['name'] + '\n')
-            print(f"   {len(candidates_no_cv)} candidates without CV (saved to no_cv.txt)")
-
         print(f"\n   To download: {len(candidates_with_cv)} | Already done: {already_processed} | Without CV: {len(candidates_no_cv)}")
 
         # Use recovered count (not announced) - some candidates may be archived by Indeed
@@ -1897,8 +1931,8 @@ class IndeedDownloader:
 
         if not candidates_with_cv:
             print("   All CVs are already downloaded!")
-            # Save stats: announced, recovered, processed
-            self._save_job_stats(total_expected, total_recovered, already_processed + len(candidates_no_cv))
+            self._finalize_job_manifest(total_expected, total_recovered,
+                                        all_candidates_list, 0)
             # Global counter parity with the Frontend path so the end-of-run
             # summary reflects work actually seen by this job.
             self.stats['total_processed'] += already_processed + len(candidates_no_cv)
@@ -1934,9 +1968,8 @@ class IndeedDownloader:
                 self.stats['total_processed'] += 1
                 pbar.update(1)
 
-        # Save stats: announced, recovered, processed
-        total_processed = already_processed + len(candidates_no_cv) + downloaded_count
-        self._save_job_stats(total_expected, total_recovered, total_processed)
+        self._finalize_job_manifest(total_expected, total_recovered,
+                                    all_candidates_list, downloaded_count)
 
         # Track job stats for report
         self.job_stats.append({

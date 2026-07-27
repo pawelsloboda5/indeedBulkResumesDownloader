@@ -460,3 +460,13 @@ def resolve_legacy_folder_by_name(download_root: Path, title_clean: str,
     if len(candidates) != 1:
         return None
     return candidates[0]
+
+
+def should_abort_empty_api(manifest: dict, fetched: int) -> bool:
+    """True when the API returned nothing for a job that has entries on disk.
+
+    That combination means the session expired or Indeed throttled the run,
+    not that the applicants vanished. Writing state in that case would wipe
+    a good index, so the caller leaves every file untouched.
+    """
+    return fetched == 0 and bool(manifest.get("candidates"))

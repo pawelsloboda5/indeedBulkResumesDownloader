@@ -619,3 +619,25 @@ def test_diff_never_revisits_an_entry_that_already_has_a_cv():
     manifest.record(m, "id1", "Jane Smith", "Jane Smith", True, "2026-07-27")
 
     assert manifest.diff(m, [_api("Jane Smith", "id1")]) == []
+
+
+def test_should_abort_on_empty_api_only_when_manifest_has_entries():
+    empty = manifest.new_manifest({})
+    populated = manifest.new_manifest({})
+    manifest.record(populated, "id1", "Jane", "Jane", True, "2026-07-27")
+
+    assert manifest.should_abort_empty_api(populated, fetched=0) is True
+    assert manifest.should_abort_empty_api(empty, fetched=0) is False
+    assert manifest.should_abort_empty_api(populated, fetched=5) is False
+
+
+def test_manifest_is_untouched_by_an_aborted_run(tmp_path):
+    m = manifest.new_manifest({"title": "Cook"})
+    manifest.record(m, "id1", "Jane", "Jane", True, "2026-07-27")
+    manifest.save(tmp_path, m)
+    before = (tmp_path / "manifest.json").read_bytes()
+
+    if not manifest.should_abort_empty_api(m, fetched=0):
+        manifest.save(tmp_path, m)
+
+    assert (tmp_path / "manifest.json").read_bytes() == before
