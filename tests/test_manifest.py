@@ -236,6 +236,38 @@ def test_promote_leaves_unmatched_backfill_entries_alone(tmp_path):
     assert "_backfill:gone person" in m["candidates"]
 
 
+def test_promote_refuses_a_backfill_entry_two_api_candidates_both_claim(tmp_path):
+    # The old build put two same-named applicants in ONE folder, so migration
+    # day yields a single _backfill: entry that two real IDs both match. Whoever
+    # is promoted inherits has_cv=True and is never re-fetched, while the resume
+    # in that folder may be the other person's. Every other ambiguous lookup in
+    # this module refuses; this one must too. Refusing costs one extra folder,
+    # which is the recoverable failure. Latching is not.
+    _make_candidate(tmp_path, "John Smith", 5000)
+    m = manifest.backfill_from_disk(tmp_path, {}, "2026-07-27")
+
+    api = [_api("John Smith", "id-AAA"), _api("John Smith", "id-BBB")]
+    promoted = manifest.promote_backfilled(m, api)
+
+    assert promoted == 0
+    assert "_backfill:john smith" in m["candidates"]
+    assert [c["legacy_id"] for c in manifest.diff(m, api)] == ["id-AAA", "id-BBB"]
+
+
+def test_promote_still_matches_a_unique_name_alongside_an_ambiguous_one(tmp_path):
+    # The refusal above must be scoped to the ambiguous name only.
+    _make_candidate(tmp_path, "John Smith", 5000)
+    _make_candidate(tmp_path, "Jane Doe", 5000)
+    m = manifest.backfill_from_disk(tmp_path, {}, "2026-07-27")
+
+    manifest.promote_backfilled(
+        m, [_api("John Smith", "id-AAA"), _api("John Smith", "id-BBB"), _api("Jane Doe", "id-CCC")]
+    )
+
+    assert m["candidates"]["id-CCC"]["folder"] == "Jane Doe"
+    assert "_backfill:john smith" in m["candidates"]
+
+
 def test_diff_returns_only_unknown_candidates(tmp_path):
     m = manifest.new_manifest({})
     m["candidates"]["known1"] = {"name": "A", "folder": "A", "has_cv": True,
@@ -339,6 +371,38 @@ def test_allocate_folder_is_stable_for_the_same_id(tmp_path):
     again = manifest.allocate_candidate_folder(tmp_path, m, "id1", "John Smith")
 
     assert again == first
+
+
+def test_allocate_folder_refuses_a_populated_folder_no_entry_claims(tmp_path):
+    # The Selenium path writes resumes without ever calling record(), so its
+    # folders are invisible to the manifest. needs_backfill only recovers them
+    # while the manifest is EMPTY, so once one API candidate is recorded those
+    # folders stay unclaimed forever — and taken/ is built from entries alone.
+    # Handing this folder to the next same-named applicant destroys a resume.
+    m = manifest.new_manifest({})
+    manifest.record(m, "id-api", "Alice Adams", "Alice Adams", True, "2026-07-27")
+
+    orphan = tmp_path / "John Smith"
+    orphan.mkdir()
+    (orphan / manifest.RESUME_FILENAME).write_bytes(b"%PDF-1.4" + b"x" * 50000)
+
+    folder = manifest.allocate_candidate_folder(tmp_path, m, "id-other", "John Smith")
+
+    assert folder.name == "John Smith (2)"
+    assert (orphan / manifest.RESUME_FILENAME).read_bytes().startswith(b"%PDF-1.4")
+
+
+def test_allocate_folder_reuses_an_empty_folder_left_by_a_failed_download(tmp_path):
+    # download_cv_api unlinks a truncated resume and skips record(), leaving an
+    # empty directory. That one must stay reusable or every failed attempt
+    # leaks a numbered folder. Emptiness is what separates it from the orphan
+    # case above.
+    m = manifest.new_manifest({})
+    (tmp_path / "John Smith").mkdir()
+
+    folder = manifest.allocate_candidate_folder(tmp_path, m, "id1", "John Smith")
+
+    assert folder.name == "John Smith"
 
 
 def test_two_same_name_candidates_keep_separate_resumes(tmp_path):

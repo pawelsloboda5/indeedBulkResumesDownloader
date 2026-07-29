@@ -218,13 +218,32 @@ def promote_backfilled(manifest: dict, api_candidates: list) -> int:
 
     Mutates `manifest` in place. Returns how many entries were promoted.
     Runs before diff() so a backfilled folder is never re-downloaded.
+
+    A backfilled entry that TWO API candidates both match is refused, not
+    latched. The old build wrote same-named applicants into one folder, so one
+    _backfill: entry can stand for two people. Promoting either one hands it a
+    folder holding a resume that may belong to the other, marks it has_cv, and
+    diff() then never re-fetches it — silent and permanent. Refusing leaves the
+    entry in place and sends both down the normal path into their own suffixed
+    folders. That costs one stale entry and one extra download; the same
+    refuse-when-ambiguous rule find_key_by_name and resolve_legacy_folder_by_name
+    already follow, and for the same reason: a duplicate folder can be sorted
+    out by hand, a merged one cannot.
     """
+    claims: dict = {}
+    for candidate in api_candidates:
+        if candidate.get("legacy_id"):
+            key = BACKFILL_PREFIX + normalize_name(candidate.get("name", ""))
+            claims[key] = claims.get(key, 0) + 1
+
     promoted = 0
     for candidate in api_candidates:
         legacy_id = candidate.get("legacy_id")
         if not legacy_id or legacy_id in manifest["candidates"]:
             continue
         backfill_key = BACKFILL_PREFIX + normalize_name(candidate.get("name", ""))
+        if claims.get(backfill_key, 0) > 1:
+            continue
         entry = manifest["candidates"].pop(backfill_key, None)
         if entry is None:
             continue
@@ -283,6 +302,28 @@ def _folder_key(folder: str) -> str:
     return unicodedata.normalize("NFC", folder or "").casefold()
 
 
+def _holds_someone_elses_files(job_folder: Path, folder_name: str) -> bool:
+    """True when this folder exists on disk with files no manifest entry claims.
+
+    The manifest is not a complete picture of the job folder. The Selenium path
+    writes resumes and never calls record(), and needs_backfill only recovers
+    those while the manifest is still EMPTY — so once one API candidate is
+    recorded, a Selenium-written folder is invisible to the caller's `taken`
+    set for good. Handing it to the next same-named applicant overwrites a real
+    resume, silently.
+
+    Emptiness is the discriminator. download_cv_api unlinks a truncated resume
+    and skips record(), leaving an empty directory behind; that one has to stay
+    reusable or every failed attempt leaks a numbered folder.
+    """
+    candidate = Path(job_folder) / folder_name
+    try:
+        return candidate.is_dir() and any(candidate.iterdir())
+    except OSError:
+        # Unreadable is not evidence of emptiness. Treat it as occupied.
+        return True
+
+
 def allocate_candidate_folder(job_folder: Path, manifest: dict, key: str, name: str) -> Path:
     """Return (and create) this candidate's folder inside the job folder.
 
@@ -315,7 +356,7 @@ def allocate_candidate_folder(job_folder: Path, manifest: dict, key: str, name: 
     }
     base = sanitize_folder_name(name)
     chosen, n = base, 2
-    while _folder_key(chosen) in taken:
+    while _folder_key(chosen) in taken or _holds_someone_elses_files(job_folder, chosen):
         chosen = f"{base} ({n})"
         n += 1
 

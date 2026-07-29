@@ -1474,15 +1474,40 @@ class IndeedDownloader:
         look the key up by name first. Without that lookup the two flows
         allocate different folders and the screener Q&A files land away from
         the resume.
+
+        The allocation is recorded before it is returned. allocate_candidate_folder
+        reserves nothing — it derives the suffix from the manifest and from what
+        is already on disk, so a folder nobody recorded is indistinguishable
+        from a folder written by the Selenium path, and gets skipped as if it
+        belonged to someone else. An applicant with no resume is recorded with
+        folder=None, so without this their app-data folder would move to
+        "(2)", "(3)" on each run, stranding earlier screener answers.
+
+        has_cv is carried through untouched: it drives no_cv.txt and drives
+        whether diff() re-fetches, and writing screener answers is not evidence
+        that a resume arrived.
         """
         if candidate is not None:
             key = manifest_mod.entry_key(candidate)
         else:
             key = (manifest_mod.find_key_by_name(self.current_manifest, name)
                    or manifest_mod.NOKEY_PREFIX + manifest_mod.normalize_name(name))
-        return manifest_mod.allocate_candidate_folder(
+        folder = manifest_mod.allocate_candidate_folder(
             self.current_job_folder, self.current_manifest, key, name
         )
+
+        entry = self.current_manifest['candidates'].get(key)
+        if not entry or entry.get('folder') != folder.name:
+            manifest_mod.record(
+                self.current_manifest, key,
+                (entry or {}).get('name') or name,
+                folder.name,
+                bool(entry and entry.get('has_cv')),
+                time.strftime('%Y-%m-%d'),
+            )
+            manifest_mod.save(self.current_job_folder, self.current_manifest)
+
+        return folder
 
     def download_cv_api(self, candidate: dict) -> bool:
         """Download CV via API"""
