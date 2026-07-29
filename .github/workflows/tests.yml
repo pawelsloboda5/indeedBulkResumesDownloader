@@ -18,6 +18,10 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
+          # Match build-exe.yml, and do not bump past 3.11 there or here —
+          # undetected-chromedriver 3.5.5 imports distutils, gone in 3.12.
+          # Testing on a Python the .exe is never built with would prove the
+          # wrong thing. See NEXT_STEPS.md.
           python-version: "3.11"
 
       - name: Install deps

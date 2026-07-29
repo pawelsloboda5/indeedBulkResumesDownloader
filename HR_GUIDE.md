@@ -66,6 +66,24 @@ For the live test call: **`1`** and press Enter. For the real bulk run afterward
 ```
 Most teams want **`4`** (Open + Paused) or **`1`** (Open only). Pick what fits your current need.
 
+```
+📎 APPLICATION DATA:
+   1. Yes - Download application data (screener questions + raw JSON)
+   2. No - CVs only
+```
+Type **`1`** if you want each applicant's screener answers saved alongside their
+resume, **`2`** for resumes only. With `1`, each applicant's folder also gets an
+`application.html` and an `application.json`.
+
+```
+🖥  BROWSER LAUNCH:
+   1. Auto — the tool opens & drives Chrome for you (default)
+   2. Attach — the tool opens Chrome, YOU log in manually,
+      then the tool takes over.
+```
+Type **`1`**. Only use **`2`** if option 1 gave you an "unexpected error" on the
+Indeed login screen.
+
 **If you picked "Single job":** the tool will pause and ask you to navigate in the Chrome window to the job you want. Click into the job's candidate list on employers.indeed.com, then press Enter in the console.
 
 **If you picked "All jobs":** the tool fetches the full list, shows you how many
@@ -146,17 +164,24 @@ These are specific to this tool because you're handling candidate PII and a live
 - The file `logs\indeed_cookies.json` is your active Indeed session. Anyone with this file can act as you on Indeed for ~24 hours.
 - **Do not** email, Slack, or share this file with anyone.
 - **Do not** commit it to any git repo / SharePoint / shared drive.
-- When you're done with the whole project, **delete the entire `logs\` folder.** This is
-  safe to do at any time. The record of who has already been downloaded lives in each
-  job folder (`manifest.json`), not in `logs\`.
+- When you're done with the whole project, **delete the entire `logs\` folder.** In
+  Backend mode (option `1`) this is safe at any time — the record of who has already
+  been downloaded lives in each job folder (`manifest.json`), not in `logs\`.
+  In Frontend mode (option `2`, the fallback) some of that bookkeeping is still kept
+  in `logs\`, so deleting it mid-project means those jobs re-download applicants you
+  already have. Nothing is lost either way; it just costs another pass. If you have
+  used Frontend mode, delete `logs\` at the end rather than between runs.
 
 **Downloaded CVs — treat per GDPR / your company policy:**
 - The `downloads\` folder contains candidate PII.
 - Move it into the company's document management system (wherever HR normally stores candidate records) as soon as you can.
 - Delete the local `downloads\` folder after it's been archived centrally.
-- If you want to keep topping a job up later, copy the job's folder back next to the
-  .exe before re-running. It carries its own `manifest.json`, so the tool picks up
-  exactly where it left off instead of downloading everyone again.
+- If you want to keep topping a job up later, copy the job's folder back **into
+  `downloads\`** before re-running — inside that folder, not next to the .exe.
+  The tool only looks for existing jobs inside `downloads\`; anywhere else and it
+  starts a fresh folder and downloads everyone again. It carries its own
+  `manifest.json`, so put back in the right place it picks up exactly where it
+  left off.
 - Don't leave it on a personal laptop indefinitely.
 
 **On the .exe itself:**
