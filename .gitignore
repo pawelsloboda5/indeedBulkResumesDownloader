@@ -45,8 +45,17 @@ Thumbs.db
 downloads/*.pdf
 downloads/*.doc
 downloads/*.docx
-logs/*.log
-logs/*.json
+
+# Everything the tool writes under logs/ is sensitive: the session cookie, the
+# run logs (applicant names, and today a CTK value), the captured URLs (live
+# CSRF tokens), and attach mode's chrome_profile/ — a persistent Chrome profile
+# holding the live Indeed employer session, cookie DB and all.
+#
+# Ignore the directory rather than listing extensions. The previous rules were
+# single-level globs (logs/*.log, logs/*.json), so logs/chrome_profile/Default/
+# Cookies matched none of them and sat one `git add .` from a public fork. The
+# next artifact dropped in here is ignored by default instead of by remembering.
+logs/**
 
 # Spec files
 *.spec
