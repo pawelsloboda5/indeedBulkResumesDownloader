@@ -2415,6 +2415,16 @@ class IndeedDownloader:
         # 0/331 failure in logs/run_20260422_203651.log.
         job_legacy_encoded = quote(self.current_job_legacy_id, safe='') if self.current_job_legacy_id else ''
 
+        # Count shared display names before claiming any file — see
+        # _note_roster_slugs. Two applicants with the same name produce the
+        # same download filename, and neither file can then be attributed.
+        self._note_roster_slugs(candidates_list)
+        ambiguous = sorted(s for s, n in self.current_roster_slugs.items() if n > 1)
+        if ambiguous:
+            print(f"   ⚠ {len(ambiguous)} display name(s) are shared by more than one "
+                  f"applicant. Their application files cannot be told apart, so they "
+                  f"are left in the job folder rather than filed under a guess.")
+
         print(f"\n📎 App-data pass — visiting each of {len(candidates_list)} candidate profiles directly...")
 
         discovered = False
@@ -2500,7 +2510,8 @@ class IndeedDownloader:
                     pbar.update(1)
                     continue
 
-                helper_ok = self._download_application_data_frontend(name, candidate_folder)
+                helper_ok = self._download_application_data_frontend(
+                    name, candidate_folder, legacy_id=candidate.get('legacy_id'))
 
                 # Capture endpoint URLs for EVERY candidate attempt (success
                 # or failure), not just first-success. The previous "wait
@@ -2882,8 +2893,14 @@ class IndeedDownloader:
         except Exception:
             return False
 
-    def _download_application_data_frontend(self, name: str, candidate_folder: Path) -> bool:
+    def _download_application_data_frontend(self, name: str, candidate_folder: Path,
+                                            legacy_id: Optional[str] = None) -> bool:
         """Automate the "..." -> Download application data -> check boxes -> Download files flow.
+
+        legacy_id identifies WHICH applicant this is, and is passed straight
+        through to the JSON fetch. Without it that fetch fell back to reading
+        the id off the browser URL, which is not guaranteed to be the
+        applicant whose folder was passed in.
 
         On failure, sets `self._last_helper_failure_step` to one of:
           'kebab_in_helper' — outer wait saw kebab but re-lookup in helper failed (stale/race)
@@ -2965,7 +2982,7 @@ class IndeedDownloader:
             # automatically. Best-effort: failure is logged but doesn't
             # block overall success since the HTML file already contains
             # the same Q&A data in human-readable form.
-            self._fetch_application_json_via_page(candidate_folder)
+            self._fetch_application_json_via_page(candidate_folder, legacy_id=legacy_id)
             return True
 
         except Exception:
@@ -2975,6 +2992,64 @@ class IndeedDownloader:
             except Exception:
                 pass
             return False
+
+    def _note_roster_slugs(self, candidates_list: list) -> None:
+        """Record how many applicants in this job share each filename slug.
+
+        Indeed names the downloaded application file from the display name, so
+        two different people called "Michael Garcia" produce the same filename.
+        An exact slug match is then not proof of ownership, and the claim's
+        rename to application.html destroys the only evidence of whose it was.
+        Counting the roster up front is what lets the claim refuse.
+        """
+        counts = {}
+        for candidate in candidates_list or []:
+            slug = self._candidate_name_slug(candidate.get('name') or '')
+            if slug:
+                counts[slug] = counts.get(slug, 0) + 1
+        self.current_roster_slugs = counts
+
+    def _roster_slug_count(self, slug: str) -> int:
+        """How many applicants in this job share `slug`. 1 when unknown —
+        an unpopulated roster must not block every claim."""
+        return (getattr(self, 'current_roster_slugs', None) or {}).get(slug, 1)
+
+    @staticmethod
+    def _exact_application_html_matches(job_folder: Path, slug: str) -> list:
+        """Files in `job_folder` that provably belong to `slug`.
+
+        Exact stem match only — `<slug>-original-application` with either
+        casing of the extension. No prefix glob, no bare `*.HTML` sweep.
+        Both existed here and in the late-claim sweep, and both filed one
+        applicant's screener answers under another applicant's name:
+        "ana-ruiz" is a prefix of "ana-ruiz-martinez", and the generic
+        sweep took any stray file in the folder.
+
+        Returning nothing is the correct answer for an ambiguous file. The
+        claim renames it to application.html, which destroys the only record
+        of whose it was, so a wrong claim cannot be detected afterwards, let
+        alone undone. A file left in the job folder is visible and can be
+        placed by hand.
+
+        Verified against a real Indeed artifact: display name
+        "Bharadwaj Byroju" produced "bharadwaj-byroju-original-application.HTML"
+        — uppercase extension, no counter, no id. Both sides are lowercased so
+        the match is case-insensitive on NTFS and APFS alike.
+        """
+        if not slug:
+            return []
+        # Chrome appends " (1)", " (2)" when a file of that name is already in
+        # the folder — which is exactly the situation the late-claim sweep
+        # exists for. The slug is still exactly ours, so the counter does not
+        # weaken ownership, and refusing it stranded the file permanently.
+        wanted = re.compile(
+            rf"^{re.escape(slug)}-original-application(?: \(\d+\))?$", re.I)
+        return [
+            child for child in sorted(job_folder.glob("*"))
+            if child.is_file()
+            and child.suffix.lower() == ".html"
+            and wanted.match(child.stem)
+        ]
 
     @staticmethod
     def _candidate_name_slug(name: str) -> str:
@@ -3010,6 +3085,23 @@ class IndeedDownloader:
         Scoping to slug avoids the cross-candidate confusion entirely —
         we only touch THIS candidate's file, no matter when it landed.
 
+        The match is EXACT, and there is no generic fallback. Both used to
+        exist and both mis-filed. `{slug}*.HTML` is a prefix match, so
+        "ana-ruiz" claimed "ana-ruiz-martinez-original-application.HTML"
+        whenever Ana Ruiz's own file had not landed yet. The bare `*.HTML`
+        sweep took whatever was lying in the job folder; its own comment
+        conceded it "could pick up someone else's file" and argued that
+        renaming to a unique application.html made that safe — which
+        protects the DESTINATION from a double write and says nothing about
+        the SOURCE being the wrong person's file.
+
+        Both failures are silent and unrecoverable: the rename destroys the
+        filename that identified the real owner, and nothing else on disk
+        records where application.html came from. A file we cannot prove
+        belongs to this applicant is left alone — an unclaimed file is
+        visible in the job folder and can be placed by hand, which a
+        mis-filed one cannot.
+
         JSON note: the modal's "raw JSON" checkbox no longer triggers a
         Chrome download as of 2026-04-29 (Indeed UI change). JSON is
         fetched separately in _fetch_application_json_via_page() via
@@ -3019,29 +3111,34 @@ class IndeedDownloader:
         html_target = candidate_folder / "application.html"
         slug = self._candidate_name_slug(name)
 
+        # Two cases where no file can be attributed to this applicant. Both
+        # return immediately rather than polling for 30s and then reporting
+        # 'files', which is indistinguishable from "Chrome downloaded nothing"
+        # and — five in a row — aborts the app-data pass for everyone left.
+        if not slug:
+            # _candidate_name_slug strips to ASCII, so a name written entirely
+            # in CJK, Cyrillic, Arabic, Hangul or Greek slugs to "". We cannot
+            # tell which file is theirs. The JSON fetch is id-driven and still
+            # correct, so let the caller reach it.
+            if self.log:
+                self.log.event('app_data_html_unmatchable_name',
+                               {'reason': 'slug_empty_after_ascii_fold'})
+            self._last_helper_failure_step = 'html_unmatchable_name'
+            return html_target.exists()
+
+        if self._roster_slug_count(slug) > 1:
+            # Indeed derives the filename from the display name, so two
+            # different people with the same name produce the same filename
+            # and the second gets Chrome's " (1)". Neither file is
+            # attributable. Claiming either one files a stranger's screener
+            # answers and the rename destroys the evidence.
+            if self.log:
+                self.log.event('app_data_html_ambiguous_name', {'slug': slug})
+            self._last_helper_failure_step = 'html_ambiguous_name'
+            return html_target.exists()
+
         def _find_html_matches():
-            # Slug-scoped first (most-specific match), then generic fallback
-            # for the rare case Indeed serves a different filename pattern.
-            specific = []
-            if slug:
-                specific = (
-                    list(job_folder.glob(f"{slug}-original-application.HTML"))
-                    + list(job_folder.glob(f"{slug}-original-application.html"))
-                    + list(job_folder.glob(f"{slug}*.HTML"))
-                    + list(job_folder.glob(f"{slug}*.html"))
-                )
-            if specific:
-                return specific
-            # Generic fallback: only used if slug had no matches. In a
-            # multi-candidate run this could pick up someone else's file,
-            # but we de-duplicate via the html_target uniqueness — once we
-            # rename a file to candidate_folder/application.html, no other
-            # candidate's flow will touch that location.
-            return (
-                list(job_folder.glob("*-original-application.HTML"))
-                + list(job_folder.glob("*-original-application.html"))
-                + list(job_folder.glob("*.HTML"))
-            )
+            return self._exact_application_html_matches(job_folder, slug)
 
         html_found = html_target.exists()
 
@@ -3123,6 +3220,9 @@ class IndeedDownloader:
             return 0
         job_folder = self.current_job_folder
         claimed = 0
+        # Same shared-display-name guard as the main pass: this sweep runs on
+        # its own after an abort, so it cannot rely on the pass having set it.
+        self._note_roster_slugs(candidates_list)
 
         for candidate in candidates_list or []:
             name = candidate.get('name') or ''
@@ -3134,12 +3234,16 @@ class IndeedDownloader:
             if not slug:
                 continue
 
-            matches = (
-                list(job_folder.glob(f"{slug}-original-application.HTML"))
-                + list(job_folder.glob(f"{slug}-original-application.html"))
-                + list(job_folder.glob(f"{slug}*.HTML"))
-                + list(job_folder.glob(f"{slug}*.html"))
-            )
+            # Exact match only — see _exact_application_html_matches. The
+            # sweep walks candidates in list order, so a prefix glob let a
+            # shorter slug reach a longer-named applicant's file first: one
+            # gained someone else's answers, the real owner found nothing.
+            if self._roster_slug_count(slug) > 1:
+                if self.log:
+                    self.log.event('app_data_html_ambiguous_name',
+                                   {'slug': slug, 'where': 'late_claim'})
+                continue
+            matches = self._exact_application_html_matches(job_folder, slug)
             if not matches:
                 continue
 
@@ -3181,7 +3285,8 @@ class IndeedDownloader:
 
         return claimed
 
-    def _fetch_application_json_via_page(self, candidate_folder: Path) -> bool:
+    def _fetch_application_json_via_page(self, candidate_folder: Path,
+                                         legacy_id: Optional[str] = None) -> bool:
         """Best-effort fetch of the candidate's screener Q&A JSON from
         Indeed's iq/job/answers endpoint, executed via fetch() inside
         the candidate's profile page (so cookies + CSRF are inherited).
@@ -3193,7 +3298,29 @@ class IndeedDownloader:
                 &indeedClientApplication=candidate-qualifications
                 &candidateIds=<legacy_id>
 
-        legacy_id is read from the current page URL (?id=<legacy_id>).
+        Which applicant this is comes from the CALLER when the caller knows —
+        the backend pass holds the same API dict that chose candidate_folder.
+        The id used to be read off driver.current_url alone, which made the
+        answers fetched and the folder written two independent facts:
+        driver.get(profile_url) is not verified, so a soft redirect or a
+        navigation the SPA swallowed leaves the previous candidate's page
+        rendered, and that person's answers were written here. Nothing on
+        disk recorded the mismatch.
+
+        So the URL is now a CHECK, not the source. If the caller passes an id
+        and the browser is showing a different one, the navigation did not
+        land and we refuse rather than write.
+
+        The URL is only read at all on a `/candidates/view` profile page. On
+        the LIST view, `/candidates?id=X`, that X is the JOB short id — this
+        file reads exactly that shape into current_job_legacy_id, and the real
+        run log shows `URL: .../candidates?id=039e9cc5ab1c` followed by
+        `Job legacy id: 039e9cc5ab1c`. Treating it as a candidate id asks
+        Indeed for the job and files the answer under whichever applicant
+        happens to be in hand. The frontend pass, which reaches a candidate by
+        clicking and carries no id of its own, is exactly the caller that can
+        be sitting on the list view.
+
         CSRF token is discovered by trying meta tag, cookie, and inline
         HTML scrape — Indeed exposes it in at least one of these.
 
@@ -3204,16 +3331,34 @@ class IndeedDownloader:
         """
         try:
             current_url = self.driver.current_url or ''
-            m = re.search(r'[?&]id=([^&]+)', current_url)
-            if not m:
-                if self.log:
-                    self.log.event('app_data_json_fetch_skip',
-                                   {'reason': 'no_id_in_url', 'url': current_url[:200]})
-                return False
-            candidate_id = m.group(1)
         except Exception as e:
+            current_url = ''
             if self.log:
-                self.log.event('app_data_json_fetch_skip', {'reason': 'url_read_failed', 'err': repr(e)})
+                self.log.event('app_data_json_fetch_skip',
+                               {'reason': 'url_read_failed', 'err': repr(e)})
+        # Only a profile page's `id=` is a candidate. See the docstring: on the
+        # list view it is the JOB id.
+        url_id = None
+        if '/candidates/view' in urlparse(current_url).path:
+            m = re.search(r'[?&]id=([^&]+)', current_url)
+            url_id = unquote(m.group(1)) if m else None
+
+        if legacy_id and url_id and str(url_id) != str(legacy_id):
+            # The browser is not where the caller thinks it is. Writing now
+            # files this applicant's folder with someone else's answers.
+            if self.log:
+                self.log.event('app_data_json_fetch_skip', {
+                    'reason': 'url_id_does_not_match_caller',
+                    'expected': str(legacy_id),
+                    'browser_showing': str(url_id),
+                })
+            return False
+
+        candidate_id = str(legacy_id or url_id or '')
+        if not candidate_id:
+            if self.log:
+                self.log.event('app_data_json_fetch_skip',
+                               {'reason': 'no_id_from_caller_or_url'})
             return False
 
         # Get a CSRF token. Cache it the first time we discover one — the
