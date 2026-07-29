@@ -75,5 +75,16 @@ indeed_graphql_*.txt
 # Live Indeed session token — treat like a password (see HR_GUIDE.md security checklist)
 indeed_cookies.json
 
+# Screenshots from debugging sessions. These are taken over a live Indeed
+# employer console, so they capture real applicant profiles — education,
+# certifications, candidate IDs. This repo is a PUBLIC fork; a single
+# `git add .` would publish them irreversibly.
+*.png
+
+# Run reports: job titles and counts, no applicant names, but no reason to
+# ship them. logs/*.log and logs/*.json are already covered above; .txt is not.
+download_report.txt
+logs/*.txt
+
 # Subagent-driven-development scratch workspace
 .superpowers/
