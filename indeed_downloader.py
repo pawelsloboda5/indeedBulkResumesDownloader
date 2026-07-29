@@ -1105,8 +1105,20 @@ class IndeedDownloader:
                             try:
                                 m = json.loads(log['message'])['message']
                                 if m.get('method') == 'Network.requestWillBeSent':
-                                    u = m['params']['request']['url']
-                                    sample_urls.append(u[:140])
+                                    # Path only. This branch fires when auth did
+                                    # NOT complete, i.e. exactly when the perf
+                                    # log is full of login-flow URLs and exactly
+                                    # when HR is most likely to send this file.
+                                    # Truncating to 140 chars was not redaction:
+                                    # the real URLs put indeedcsrftoken well
+                                    # inside the first 140 characters. The
+                                    # question this answers is "did anything
+                                    # reach apis.indeed.com", which needs no
+                                    # query string.
+                                    parsed_u = urlparse(m['params']['request']['url'])
+                                    sample_urls.append(
+                                        parsed_u._replace(query='', fragment='').geturl()[:140]
+                                    )
                             except (KeyError, json.JSONDecodeError):
                                 continue
                         self.log.event('api_key_capture', {
@@ -1329,7 +1341,18 @@ class IndeedDownloader:
     def fetch_candidates_api(self, offset: int = 0, limit: int = 100, dispositions: list = None, sort_by: str = "APPLY_DATE", sort_order: str = "DESCENDING"):
         """Fetch candidates using GraphQL API via browser.
 
-        Returns (matches, total, has_next_page).
+        Returns (matches, total, has_next_page, ok).
+
+        `ok` is the whole point. Every other return value is identical for a
+        query that FAILED and a job that is genuinely EMPTY — both are
+        ([], 0, False) — and every guard downstream was built on that
+        ambiguity. A total failure in single-job mode reached "All CVs are
+        already downloaded!" because total_expected came back 0, so the two
+        checks that would have caught it (`== 0 and expected > 0`, then
+        `fetched < expected`) both short-circuited.
+
+        Callers must treat ok=False as "this pass told us nothing", never as
+        "there is nothing here".
         """
         # legacyID lives on 5 distinct CandidateSubmission union types; missing
         # any of them drops that candidate silently (legacyID becomes None and
@@ -1414,7 +1437,7 @@ class IndeedDownloader:
         if not self.api_key or not self.ctk:
             print("❌ Aborting: missing indeed-api-key or CTK (auth did not complete).")
             print("   Delete logs/indeed_cookies.json and re-run to log in fresh.")
-            return [], 0, False
+            return [], 0, False, False
 
         js_code = f"""
         return await fetch("https://apis.indeed.com/graphql?co=US&locale=en-US", {{
@@ -1436,7 +1459,7 @@ class IndeedDownloader:
             result = self.driver.execute_script(js_code)
             if not result:
                 print(f"   ⚠ GraphQL returned no response (auth may have expired)")
-                return [], 0, False
+                return [], 0, False, False
             if 'errors' in result:
                 print(f"   ⚠ GraphQL errors from Indeed:")
                 msgs = []
@@ -1452,7 +1475,7 @@ class IndeedDownloader:
                         'dispositions': dispositions,
                         'offset': offset,
                     })
-                return [], 0, False
+                return [], 0, False, False
 
             rcp = result.get('data', {}).get('findRCPMatches', {}) or {}
             conn = rcp.get('matchConnection', {}) or {}
@@ -1461,10 +1484,10 @@ class IndeedDownloader:
             has_next_page = bool((conn.get('pageInfo') or {}).get('hasNextPage'))
             if offset == 0:
                 print(f"   🔎 Server returned: overallMatchCount={total}, matches_on_page={len(matches)}, hasNextPage={has_next_page}")
-            return matches, total, has_next_page
+            return matches, total, has_next_page, True
         except Exception as e:
             print(f"❌ API error: {e}")
-            return [], 0, False
+            return [], 0, False, False
 
     def _candidate_folder_for(self, name: str, candidate: dict = None) -> Path:
         """Resolve (and create) one candidate's folder, consistently.
@@ -1605,8 +1628,13 @@ class IndeedDownloader:
         print(f"   URL: {job_url}")
         print(f"   Extracted job IRI: {self.current_job_id or '(none)'}")
         print(f"   Job legacy id:     {self.current_job_legacy_id or '(none — app-data pass may fall back)'}")
+        # Both are truncated. Every print() is teed into the run log, and the
+        # tool then tells HR to send that file when something breaks — so a
+        # full value here walks a live session credential into an email or a
+        # Teams thread. The diagnostic question is "did we get one", which a
+        # prefix answers. CTK used to be printed in full.
         print(f"   API key: {self.api_key[:12] + '...' if self.api_key else '(MISSING — auth may have failed)'}")
-        print(f"   CTK:     {self.ctk or '(MISSING — auth may have failed)'}")
+        print(f"   CTK:     {self.ctk[:6] + '...' if self.ctk else '(MISSING — auth may have failed)'}")
 
         # Single-mode guard: if we couldn't pull a job IRI from the URL, bail
         # out instead of silently falling through to an unscoped GraphQL
@@ -1687,15 +1715,26 @@ class IndeedDownloader:
         self._download_all_candidates_api()
 
     def _fetch_candidates_batch(self, dispositions: list, sort_by: str = "APPLY_DATE", sort_order: str = "DESCENDING") -> tuple:
-        """Fetch candidates with specific filters, returns (candidates_list, total_count)"""
+        """Fetch every page for one disposition set.
+
+        Returns (candidates_list, total_count, ok). `ok` is False if ANY page
+        failed, because a partial list is not a short list — it is a list the
+        caller must not reconcile against a total or feed to mark_stale.
+
+        A failure mid-pagination previously broke the loop exactly like
+        reaching the end, so the caller received a truncated list it believed
+        was complete.
+        """
         all_candidates = {}  # Use dict to dedupe by legacy_id
         offset = 0
         total_announced = 0
+        limit = 100
+        ok = True
 
         while True:
-            matches, total, has_next_page = self.fetch_candidates_api(
+            matches, total, has_next_page, page_ok = self.fetch_candidates_api(
                 offset=offset,
-                limit=100,
+                limit=limit,
                 dispositions=dispositions,
                 sort_by=sort_by,
                 sort_order=sort_order
@@ -1703,6 +1742,10 @@ class IndeedDownloader:
 
             if offset == 0:
                 total_announced = total
+
+            if not page_ok:
+                ok = False
+                break
 
             if not matches:
                 break
@@ -1727,10 +1770,23 @@ class IndeedDownloader:
 
             if not has_next_page:
                 break
-            offset += 100
+
+            # Advance by what the server actually returned, not by what we
+            # asked for. A fixed +100 stride silently skips (100 - actual)
+            # records on every page if Indeed ever clamps the page size while
+            # still reporting hasNextPage. The live dashboard requests 20.
+            if len(matches) < limit:
+                print(f"   ⚠ Server returned {len(matches)} of {limit} requested "
+                      f"but reports more pages — advancing by {len(matches)}.")
+                if self.log:
+                    self.log.event('page_size_clamped', {
+                        'requested': limit, 'returned': len(matches),
+                        'offset': offset, 'dispositions': dispositions,
+                    })
+            offset += len(matches)
             time.sleep(0.3)
 
-        return list(all_candidates.values()), total_announced
+        return list(all_candidates.values()), total_announced, ok
 
     def _finalize_job_manifest(self, total_announced: int, total_recovered: int,
                                all_candidates_list: list, downloaded: int) -> None:
@@ -1782,24 +1838,81 @@ class IndeedDownloader:
 
         # Pass 1: active pipeline, sort by date DESC (default view).
         print("   Fetching candidates (active pipeline)...")
-        candidates, api_total = self._fetch_candidates_batch(active_dispositions, "APPLY_DATE", "DESCENDING")
+        candidates, api_total, active_ok = self._fetch_candidates_batch(active_dispositions, "APPLY_DATE", "DESCENDING")
         for c in candidates:
             if c['legacy_id'] not in all_candidates:
                 all_candidates[c['legacy_id']] = c
-        print(f"      {len(all_candidates)} fetched")
+        active_fetched = len(all_candidates)
+        print(f"      {active_fetched} fetched")
 
-        # Pass 1.5: each post-active disposition in isolation. If one of
-        # these enum values is unsupported by Indeed's providers, its pass
-        # returns [] (with a logged error) and we continue with the next.
+        # The active pass is the one that carries the announced total. If it
+        # failed we know nothing about this job — not that it is empty — so
+        # stop before anything writes a manifest, a stats file, a report line,
+        # or the words "All CVs are already downloaded". Continuing here is
+        # what let a dead session be reported to HR as a finished job.
+        if not active_ok:
+            print("\n   ❌ Could not read this job's applicant list — the request failed.")
+            print("      This is NOT the same as the job having no applicants.")
+            print("      Nothing has been changed on disk. Common causes:")
+            print("        • Your Indeed session expired — delete logs/indeed_cookies.json and re-run")
+            print("        • Indeed is throttling — wait a few minutes and re-run")
+            self.stats['failed_jobs'] = self.stats.get('failed_jobs', 0) + 1
+            if self.log:
+                self.log.event('active_pass_failed', {
+                    'dispositions': active_dispositions,
+                    'announced': api_total,
+                    'fetched': active_fetched,
+                })
+            return
+
+        # Pass 1.5: each post-active disposition in isolation, so one
+        # unsupported enum value fails its own pass instead of the whole run.
+        #
+        # A failed pass is reported, not swallowed. AUTO_REJECTED and WITHDRAWN
+        # both return AllMatchProvidersFailedException on every real run against
+        # this account — with valid auth — and the old code printed nothing at
+        # all for them, because a failed pass and an empty one both arrived as
+        # (0 new, 0 announced). Indeed auto-rejects anyone who fails a knock-out
+        # screener question, so those applicants exist, are absent from every
+        # folder, and were absent from every count HR had ever seen.
+        unreadable = []
+        reconciliation = [('active pipeline', api_total, active_fetched)]
         for d in extra_dispositions:
-            extra_candidates, extra_total = self._fetch_candidates_batch([d], "APPLY_DATE", "DESCENDING")
+            extra_candidates, extra_total, extra_ok = self._fetch_candidates_batch([d], "APPLY_DATE", "DESCENDING")
             new_count = 0
             for c in extra_candidates:
                 if c['legacy_id'] not in all_candidates:
                     all_candidates[c['legacy_id']] = c
                     new_count += 1
+            if not extra_ok:
+                unreadable.append(d)
+                print(f"      ⚠ {d}: could not be read — any applicants in this "
+                      f"group are NOT in this folder")
+                continue
+            reconciliation.append((d, extra_total, len(extra_candidates)))
             if new_count > 0 or extra_total > 0:
                 print(f"      +{new_count} {d} (server reported {extra_total})")
+
+        # Reconcile per pass. The old check compared an active-only denominator
+        # against an all-disposition numerator ("Total expected: 16 | Fetched:
+        # 20" on a real run), so `fetched < expected` could not fire even when
+        # the active pass genuinely dropped people.
+        for label, announced, fetched in reconciliation:
+            if announced > 0 and fetched < announced:
+                print(f"      ⚠ {label}: Indeed reported {announced} but only "
+                      f"{fetched} could be fetched ({announced - fetched} missing)")
+                if self.log:
+                    self.log.event('pass_under_fetched', {
+                        'pass': label, 'announced': announced, 'fetched': fetched,
+                    })
+
+        if unreadable:
+            self._unreadable_dispositions = list(unreadable)
+            print(f"\n   ⚠ {len(unreadable)} applicant group(s) could not be read: "
+                  f"{', '.join(unreadable)}")
+            print(f"      The counts below exclude them.")
+            if self.log:
+                self.log.event('dispositions_unreadable', {'dispositions': unreadable})
 
         # Use job_total_candidates if available (more accurate), otherwise use API total
         total_expected = job_total_candidates if job_total_candidates > 0 else api_total
@@ -1813,7 +1926,7 @@ class IndeedDownloader:
 
             # Pass 2: Sort by date ASC
             print("   Pass 2: By date (oldest -> newest)...")
-            candidates, _ = self._fetch_candidates_batch(all_dispositions, "APPLY_DATE", "ASCENDING")
+            candidates, _, _ = self._fetch_candidates_batch(all_dispositions, "APPLY_DATE", "ASCENDING")
             new_count = 0
             for c in candidates:
                 if c['legacy_id'] not in all_candidates:
@@ -1824,7 +1937,7 @@ class IndeedDownloader:
             # Pass 3: Sort by name ASC (if still missing)
             if len(all_candidates) < total_expected:
                 print("   Pass 3: By name (A -> Z)...")
-                candidates, _ = self._fetch_candidates_batch(all_dispositions, "NAME", "ASCENDING")
+                candidates, _, _ = self._fetch_candidates_batch(all_dispositions, "NAME", "ASCENDING")
                 new_count = 0
                 for c in candidates:
                     if c['legacy_id'] not in all_candidates:
@@ -1835,7 +1948,7 @@ class IndeedDownloader:
             # Pass 4: Sort by name DESC (if still missing)
             if len(all_candidates) < total_expected:
                 print("   Pass 4: By name (Z -> A)...")
-                candidates, _ = self._fetch_candidates_batch(all_dispositions, "NAME", "DESCENDING")
+                candidates, _, _ = self._fetch_candidates_batch(all_dispositions, "NAME", "DESCENDING")
                 new_count = 0
                 for c in candidates:
                     if c['legacy_id'] not in all_candidates:
@@ -1849,7 +1962,7 @@ class IndeedDownloader:
                 for disp in all_dispositions:
                     for sort_by in ["APPLY_DATE", "NAME"]:
                         for sort_order in ["ASCENDING", "DESCENDING"]:
-                            candidates, _ = self._fetch_candidates_batch([disp], sort_by, sort_order)
+                            candidates, _, _ = self._fetch_candidates_batch([disp], sort_by, sort_order)
                             new_count = 0
                             for c in candidates:
                                 if c['legacy_id'] not in all_candidates:
@@ -2095,7 +2208,18 @@ class IndeedDownloader:
         """Best-effort: scrape Chrome's performance log for XHR URLs that
         match known app-data patterns and append them to
         logs/app_data_urls.json. Used to bootstrap a Stage-2 pure-API
-        upgrade without requiring HR to paste DevTools output."""
+        upgrade without requiring HR to paste DevTools output.
+
+        Query strings are stripped before anything is written. They carried
+        live `indeedcsrftoken` values — 60 of them in one real artifact — plus
+        candidate ids. The upgrade this file exists to inform needs the shape
+        of the endpoint (host, path, method, whether there was a body); it
+        never needed the secrets.
+
+        The pattern is anchored to the path for the same reason it is stripped:
+        matching the whole URL meant any Indeed URL with "application" anywhere
+        in its query landed here, which is how 38 telemetry requests carrying
+        `&application=globalnav` got captured along with their parameters."""
         try:
             logs = self.driver.get_log('performance')
         except Exception:
@@ -2112,13 +2236,21 @@ class IndeedDownloader:
                 url = (params.get('request') or params.get('response') or {}).get('url', '')
                 if not url:
                     continue
-                if not re.search(r'application|cao_post_body|original-application', url, re.I):
+                parsed = urlparse(url)
+                if not re.search(r'iq/job/answers|cao_post_body|original-application|application',
+                                 parsed.path, re.I):
                     continue
-                if 'graphql' in url:
+                if 'graphql' in parsed.path:
                     continue
+                # The JS bundles are served from a path containing
+                # "original-application" and carry nothing about an applicant.
+                if re.search(r'\.(js|css|map|woff2?|png|svg|jpe?g|ico)$', parsed.path, re.I):
+                    continue
+                safe_url = parsed._replace(query='', fragment='').geturl()
                 entry = {
                     'direction': 'request' if method == 'Network.requestWillBeSent' else 'response',
-                    'url': url,
+                    'url': safe_url,
+                    'query_param_names': sorted(parse_qs(parsed.query).keys()),
                 }
                 if method == 'Network.requestWillBeSent':
                     req = params.get('request') or {}
