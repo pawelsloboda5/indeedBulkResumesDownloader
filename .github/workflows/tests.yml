@@ -1,0 +1,39 @@
+name: Tests
+
+# The manifest decides which folder each candidate's PII lands in, and until
+# now the only thing running its tests was one laptop.
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    # Same runner and Python as build-exe.yml. The tool only ever runs as a
+    # Windows .exe, and manifest.py reasons explicitly about NTFS treating
+    # "John Smith" and "john smith" as one directory — testing that on a
+    # case-sensitive filesystem would prove less than it looks like.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Match build-exe.yml, and do not bump past 3.11 there or here —
+          # undetected-chromedriver 3.5.5 imports distutils, gone in 3.12.
+          # Testing on a Python the .exe is never built with would prove the
+          # wrong thing. See NEXT_STEPS.md.
+          python-version: "3.11"
+
+      - name: Install deps
+        # The runtime deps are not needed by tests/ today. They are installed
+        # anyway so a test that imports indeed_downloader can be added without
+        # first having to fix the workflow — selenium is what blocks that.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Run tests
+        # From the repo root: tests/ import `manifest` directly and there is
+        # no conftest.py, so the root has to be the working directory.
+        run: python -m pytest tests/ -v

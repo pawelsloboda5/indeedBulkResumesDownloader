@@ -11,6 +11,14 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
+          # Do NOT bump past 3.11. undetected-chromedriver 3.5.5 imports
+          # distutils in its patcher, and distutils was removed from the stdlib
+          # in 3.12 (PEP 632); upstream has shipped nothing since Feb 2024, so
+          # there is no release that fixes it. On 3.12 the import raises,
+          # indeed_downloader catches it and falls back to stock Selenium —
+          # the mode its own comments say cannot pass Indeed's bot check. The
+          # build stays GREEN and the .exe silently loses stealth. See
+          # NEXT_STEPS.md.
           python-version: "3.11"
 
       - name: Install deps
@@ -19,11 +27,28 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller==6.3.0
 
+      - name: Prove undetected-chromedriver actually imports
+        # The build cannot catch what the code catches. indeed_downloader
+        # swallows an ImportError here and degrades silently, so without this
+        # step a missing transitive dep (requests/websockets, both pulled in
+        # unpinned by uc) or a Python bump ships a green, defanged .exe.
+        run: python -c "import undetected_chromedriver, selenium; print('uc + selenium import OK:', selenium.__version__)"
+
       - name: Build
-        run: pyinstaller --onefile --name IndeedCVDownloader --noconfirm --collect-data selenium --collect-binaries selenium indeed_downloader.py
+        run: pyinstaller --onefile --name IndeedCVDownloader --noconfirm --collect-data selenium --collect-binaries selenium --collect-all undetected_chromedriver indeed_downloader.py
 
       - name: Hash the artifact (SHA-256)
-        run: certutil -hashfile dist\IndeedCVDownloader.exe SHA256
+        # Also written to the run summary. HR_GUIDE tells the recipient to
+        # refuse to run on a fingerprint mismatch, and that instruction is only
+        # credible if the number is easy to find and hand over — buried in a
+        # step log it gets skipped.
+        run: |
+          certutil -hashfile dist\IndeedCVDownloader.exe SHA256
+          "## IndeedCVDownloader.exe SHA-256" >> $env:GITHUB_STEP_SUMMARY
+          "``````" >> $env:GITHUB_STEP_SUMMARY
+          (Get-FileHash dist\IndeedCVDownloader.exe -Algorithm SHA256).Hash >> $env:GITHUB_STEP_SUMMARY
+          "``````" >> $env:GITHUB_STEP_SUMMARY
+          "Send this alongside the .exe. See HR_GUIDE.md." >> $env:GITHUB_STEP_SUMMARY
 
       - uses: actions/upload-artifact@v4
         with:

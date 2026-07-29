@@ -66,12 +66,31 @@ For the live test call: **`1`** and press Enter. For the real bulk run afterward
 ```
 Most teams want **`4`** (Open + Paused) or **`1`** (Open only). Pick what fits your current need.
 
+```
+📎 APPLICATION DATA:
+   1. Yes - Download application data (screener questions + raw JSON)
+   2. No - CVs only
+```
+Type **`1`** if you want each applicant's screener answers saved alongside their
+resume, **`2`** for resumes only. With `1`, each applicant's folder also gets an
+`application.html` and an `application.json`.
+
+```
+🖥  BROWSER LAUNCH:
+   1. Auto — the tool opens & drives Chrome for you (default)
+   2. Attach — the tool opens Chrome, YOU log in manually,
+      then the tool takes over.
+```
+Type **`1`**. Only use **`2`** if option 1 gave you an "unexpected error" on the
+Indeed login screen.
+
 **If you picked "Single job":** the tool will pause and ask you to navigate in the Chrome window to the job you want. Click into the job's candidate list on employers.indeed.com, then press Enter in the console.
 
-**If you picked "All jobs":** the tool fetches the full list and shows you what it found. If some jobs already have downloaded folders, it asks what to do:
-- **S** — skip all jobs that already have a folder
-- **N** — only re-check jobs where new candidates arrived since last time (most common for a repeat run)
-- **K** — download everything again regardless
+**If you picked "All jobs":** the tool fetches the full list, shows you how many
+applicants each job already has on disk versus how many Indeed is showing, then
+gets to work. There is nothing to answer. It downloads only the applicants that
+are new to each folder, so re-running a job you have already done is quick and
+safe.
 
 ## Step 5 — Watch the progress bar
 
@@ -80,9 +99,9 @@ The console shows a progress bar like:
 Business Developer:  45/237 |██████░░░░░░░░░░░| 19%
 ```
 
-PDFs are appearing in `downloads\<Job Name>\` as this runs. You can leave it and come back.
+PDFs are appearing in `downloads\<Job Name>\<Candidate Name>\`, one folder per applicant, as this runs. You can leave it and come back.
 
-**If you need to stop:** just close the console window. The tool saves a checkpoint after every candidate, so the next time you run it, it picks up exactly where it left off.
+**If you need to stop:** just close the console window. The tool updates the job's record after every applicant, so the next time you run it, it picks up exactly where it left off.
 
 ## Step 6 — When it's done
 
@@ -102,10 +121,21 @@ Avg/CV:           2.4s
 ```
 
 Files you now have:
-- `downloads\<Job Name>\*.pdf` — the resumes
-- `downloads\<Job Name>\no_cv.txt` — candidates who applied without attaching a CV
-- `downloads\<Job Name>\stats.json` — per-job download statistics
+- `downloads\<Job Name>\<Candidate Name>\resume.pdf` — one folder per applicant
+- `downloads\<Job Name>\no_cv.txt` — applicants who applied without attaching a CV
+- `downloads\<Job Name>\manifest.json` — the record of who has already been downloaded
 - `downloads\download_report.txt` — overall summary across all jobs
+
+Leave `manifest.json` in the folder. It is how the tool knows who it already has, so
+running the same job again downloads only the people who applied since last time.
+
+`no_cv.txt` may list more people than it used to. It now covers everyone the tool has no
+usable resume for — someone who applied without attaching one, and also anyone whose
+resume file is missing or came down empty on an earlier run. That's a more accurate
+count, not a new problem: the tool tries those people again the next time you run the
+job, as long as Indeed is still listing them on it. Anyone Indeed has stopped returning —
+an applicant who withdrew, or an old posting whose applicants Indeed has archived —
+stays on the list without being retried, because the tool has no way left to fetch them.
 
 Close the console window when you're satisfied.
 
@@ -117,7 +147,9 @@ Close the console window when you're satisfied.
 |---|---|---|
 | Chrome doesn't open | Another Chrome with the same profile is still running | Close all Chrome windows and double-click the .exe again |
 | "Cookies expired or invalid" or login page reappears | Your saved session expired (happens ~once a day) | Just log in again in the Chrome window when prompted |
-| A job downloads 0 CVs and 50 failed | Indeed rate-limited the API briefly | Re-run; the checkpoint will only retry the failed ones |
+| A job downloads 0 CVs and 50 failed | Indeed rate-limited the API briefly | Re-run; the tool only fetches the applicants it doesn't already have |
+| `API returned 0 candidates but 33 are already on disk` | Indeed sent back nothing for a job you've already downloaded — usually an expired session or a rate limit. The tool leaves that job's folder completely alone rather than risk wiping a good record | Log in again in the Chrome window and re-run the job. If Indeed has genuinely aged out every applicant on an old job, you'll see this message every time you run it — that's expected, and your existing folder is safe |
+| `⚠ Skipping — no Indeed employerJobId on the jobs-table link` | That specific job's row in your dashboard doesn't expose a real Indeed job ID (usually very old / archived jobs) | Skip it with Backend mode; re-run just that one job using Frontend mode (Option 2) |
 | Downloads going much slower than expected | Too many parallel requests, Indeed is throttling | Nothing to do — it'll finish, just slower |
 | Windows SmartScreen blocks the exe | The exe isn't code-signed | **More info** → **Run anyway** (one time) |
 | Console window instantly closes | Usually a Chrome version mismatch | Ping Pawel — he'll send a fresh build |
@@ -132,20 +164,48 @@ These are specific to this tool because you're handling candidate PII and a live
 - The file `logs\indeed_cookies.json` is your active Indeed session. Anyone with this file can act as you on Indeed for ~24 hours.
 - **Do not** email, Slack, or share this file with anyone.
 - **Do not** commit it to any git repo / SharePoint / shared drive.
-- When you're done with the whole project, **delete the entire `logs\` folder.**
+- When you're done with the whole project, **delete the entire `logs\` folder.** In
+  Backend mode (option `1`) this is safe at any time — the record of who has already
+  been downloaded lives in each job folder (`manifest.json`), not in `logs\`.
+  In Frontend mode (option `2`, the fallback) some of that bookkeeping is still kept
+  in `logs\`, so deleting it mid-project means those jobs re-download applicants you
+  already have. Nothing is lost either way; it just costs another pass. If you have
+  used Frontend mode, delete `logs\` at the end rather than between runs.
 
 **Downloaded CVs — treat per GDPR / your company policy:**
 - The `downloads\` folder contains candidate PII.
 - Move it into the company's document management system (wherever HR normally stores candidate records) as soon as you can.
 - Delete the local `downloads\` folder after it's been archived centrally.
+- If you want to keep topping a job up later, copy the job's folder back **into
+  `downloads\`** before re-running — inside that folder, not next to the .exe.
+  The tool only looks for existing jobs inside `downloads\`; anywhere else and it
+  starts a fresh folder and downloads everyone again. It carries its own
+  `manifest.json`, so put back in the right place it picks up exactly where it
+  left off.
 - Don't leave it on a personal laptop indefinitely.
 
 **On the .exe itself:**
-- The SHA-256 hash Pawel gave you should match what you see if you run this in PowerShell:
+
+Every build of the .exe has its own SHA-256 fingerprint — a long string of letters and
+numbers. If even one byte of the file changes on its way to you, the fingerprint changes
+completely. Checking it is how you know you're running the file Pawel actually built.
+
+- **Pawel sends the expected fingerprint in the same message as the .exe.** It is not
+  printed in this guide: the guide is written once, and the fingerprint changes every
+  time the tool is rebuilt, so a number here would go out of date and you'd have no way
+  to tell. Use the one in the message that came with your copy.
+- If Pawel sends the .exe inside a `.zip`, **extract it first** — check the extracted
+  `.exe`, not the zip.
+- In PowerShell, in the folder where you saved the .exe:
   ```
   Get-FileHash IndeedCVDownloader.exe -Algorithm SHA256
   ```
-- If the hash doesn't match, **stop and tell Pawel** — the file may have been altered in transit. Don't run it.
+- Compare the `Hash` value it prints with the one in Pawel's message. Upper- and
+  lower-case don't matter; the characters themselves do.
+- If the hash doesn't match what Pawel gave you, **stop and tell Pawel** — the file may
+  have been altered in transit. Don't run it.
+- If you didn't get a fingerprint with your copy, ask Pawel for it before running the
+  .exe rather than skipping the check.
 
 ---
 
@@ -158,7 +218,9 @@ These are specific to this tool because you're handling candidate PII and a live
                           type  2  (All jobs)     Enter   [or 1 for single job]
                           type  4  (Open+Paused)  Enter   [or your preferred status]
 4.  Wait for the progress bar to finish
-5.  Find your CVs in:  downloads\<Job Name>\*.pdf
+5.  Find your CVs in:  downloads\<Job Name>\<Candidate Name>\resume.pdf
 6.  When done with the project:  delete the  logs\  folder
                                   move  downloads\  to the central archive
+                                  keep each job folder's  manifest.json  if you
+                                  might top that job up later
 ```

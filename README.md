@@ -27,16 +27,27 @@ That's it. On the next run, your session is remembered and already-downloaded CV
 
 ## Standalone Executable (No Python Required)
 
-A pre-built executable is available in the `dist/` folder — just download and run, no Python needed.
+The executable is built from source by the **Build Windows .exe** GitHub Actions
+workflow, so the binary you run corresponds to a specific commit you can read.
 
 ### Quick Start
 
-1. Download `IndeedCVDownloader.exe` from the `dist/` folder
-2. Double-click to run
-3. Log in to your Indeed Employer account in the Chrome window that opens
-4. Choose your options in the menu and start downloading!
+1. Open the **Actions** tab → **Build Windows .exe** → run it (`workflow_dispatch`)
+2. Download `IndeedCVDownloader.exe` from that run's **Artifacts**
+3. Double-click to run
+4. Log in to your Indeed Employer account in the Chrome window that opens
+5. Choose your options in the menu and start downloading!
 
 > No Python, no extension, no configuration needed.
+
+The build log's `certutil` step prints the artifact's SHA-256. Send that
+fingerprint alongside the .exe — `HR_GUIDE.md` tells the recipient to verify it
+before running, and that instruction only means something if the number is real.
+
+> **Do not distribute `dist/IndeedCVDownloader.exe` from this repo.** It is a
+> stale binary inherited from upstream and predates the current code, including
+> the per-job `manifest.json` that makes re-runs incremental. Its menus and
+> folder layout no longer match `HR_GUIDE.md`.
 
 ## Installation (Python)
 
@@ -130,15 +141,15 @@ Job list:
 
 JOBS ALREADY PRESENT IN THE DOWNLOADS FOLDER:
 ============================================================
-   [NEW] Data Scientist
-         450 processed / 550 fetched (+100 remaining)
-   [OK]  Marketing Manager (120/120)
-
-Options:
-   [S] SkipAll - Skip ALL existing jobs
-   [N] NewOnly - Only download jobs with new candidates
-   [K] KeepAll - Download every job anyway
+   Data Scientist:        450 on disk · 550 live
+   Marketing Manager:     120 on disk · 120 live
 ```
+
+There is nothing to answer here. Each job folder's `manifest.json` records who
+has already been downloaded, so the run fetches only the applicants that are new
+to that folder and leaves the rest untouched. The old `[S]`/`[N]`/`[K]` prompt
+was removed — it asked the operator to make a decision the manifest now makes
+correctly per job.
 
 ## Configuration
 
@@ -163,22 +174,31 @@ LOG_FOLDER=logs                 # Logs and checkpoints
 ```
 indeed-cv-downloader/
 ├── indeed_downloader.py        # Main script (single file, everything included)
-├── dist/
-│   └── IndeedCVDownloader.exe  # Standalone executable
+├── manifest.py                 # Per-job download index (stdlib only, no browser)
+├── tests/                      # pytest suite; run `python -m pytest tests/` from here
 ├── requirements.txt            # Python dependencies
 ├── .env.config                 # Configuration (optional)
 ├── downloads/                  # Downloaded CVs, organized by job
 │   ├── Business Developer (22-09-2025)/
-│   │   ├── Jean_Dupont_20251126_154317.pdf
-│   │   ├── Marie_Martin_20251126_154320.pdf
-│   │   ├── no_cv.txt           # Candidates without CV
-│   │   ├── stats.json          # Job download statistics
-│   │   └── checkpoint.json     # Resume state for this job
+│   │   ├── manifest.json       # Who has been downloaded — drives incremental re-runs
+│   │   ├── Jean Dupont/
+│   │   │   ├── resume.pdf
+│   │   │   ├── application.html    # Only when application data is enabled
+│   │   │   └── application.json
+│   │   ├── Marie Martin/
+│   │   │   └── resume.pdf
+│   │   ├── no_cv.txt           # Candidates who attached no CV
+│   │   └── stats.json          # Job download statistics
 │   └── download_report.txt     # Global download report
 └── logs/
     ├── indeed_cookies.json     # Auto-saved session cookies
-    └── checkpoint_unified.json # Global resume state
+    └── checkpoint_unified.json # Frontend-mode resume state
 ```
+
+One folder per applicant, named for them; a second applicant with the same
+display name gets a ` (2)` suffix rather than overwriting the first. Each job
+folder's `manifest.json` is keyed on the Indeed candidate ID, which is what lets
+a re-run fetch only the applicants who arrived since. Keep it with the folder.
 
 ## Troubleshooting
 

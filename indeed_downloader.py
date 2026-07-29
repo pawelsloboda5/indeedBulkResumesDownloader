@@ -10,7 +10,10 @@ import json
 import time
 import re
 import base64
-from urllib.parse import urlparse, parse_qs, unquote
+import shutil
+import subprocess
+import unicodedata
+from urllib.parse import urlparse, parse_qs, unquote, quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime
@@ -24,13 +27,172 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException, StaleElementReferenceException
 from tqdm import tqdm
+import platform
+import traceback
+
+# Per-job download manifest. A plain top-level import on purpose: PyInstaller
+# follows static imports during Analysis and bundles manifest.py into the
+# --onefile .exe with no spec change. A dynamic importlib.import_module runs
+# fine from source and then raises ModuleNotFoundError inside the binary HR
+# actually runs.
+import manifest as manifest_mod
 
 # Load environment variables
 load_dotenv('.env.config')
 
 
+# Bumped whenever the binary layout changes. Shown in log headers so bug
+# reports are pinned to a known build.
+TOOL_VERSION = "2026-04-29-all-jobs-legacy-id-plus-logging"
+
+
+class RunLogger:
+    """Per-run log file under logs/ that captures everything useful for a
+    bug report in one place. On exit we copy the active file to
+    logs/latest.log so HR only has to send one file.
+
+    Privacy: cookie values and JWT contents are never written; we log
+    names and truthy/falsy presence only.
+    """
+    def __init__(self, log_folder: Path):
+        self.log_folder = Path(log_folder)
+        self.log_folder.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.path = self.log_folder / f'run_{ts}.log'
+        self.latest_path = self.log_folder / 'latest.log'
+        # Line-buffered so tailing works and a crash loses at most one line.
+        self._f = open(self.path, 'w', encoding='utf-8', errors='replace', buffering=1)
+        self._write_header()
+
+    @property
+    def raw_file(self):
+        """File handle for _TeeStream to mirror stdout into."""
+        return self._f
+
+    def _write_header(self):
+        self._write('INFO', '=' * 70)
+        self._write('INFO', f'Indeed CV Downloader — run log')
+        self._write('INFO', f'Tool version: {TOOL_VERSION}')
+        self._write('INFO', f'Started:      {datetime.now().isoformat()}')
+        self._write('INFO', f'Python:       {sys.version.split()[0]}')
+        self._write('INFO', f'Platform:     {platform.platform()}')
+        self._write('INFO', f'CWD:          {Path.cwd()}')
+        self._write('INFO', '=' * 70)
+
+    def info(self, msg: str):
+        self._write('INFO', msg)
+
+    def warn(self, msg: str):
+        self._write('WARN', msg)
+
+    def error(self, msg: str, exc: Optional[BaseException] = None):
+        if exc is not None:
+            tb = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            msg = f'{msg}\n{tb}'
+        self._write('ERROR', msg)
+
+    def event(self, name: str, data: Optional[dict] = None):
+        """Structured event — machine-parseable for future dashboards.
+        Dicts are serialized with json (default=str) so complex values
+        (paths, exceptions) don't crash the logger."""
+        if data is None:
+            self._write('EVENT', name)
+        else:
+            try:
+                payload = json.dumps(data, default=str, ensure_ascii=False)
+            except Exception:
+                payload = repr(data)
+            self._write('EVENT', f'{name} {payload}')
+
+    def _write(self, level: str, msg: str):
+        try:
+            ts = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+            self._f.write(f'[{ts}] {level:5} {msg}\n')
+        except Exception:
+            pass
+
+    def close(self):
+        self._write('INFO', 'run_end')
+        try:
+            self._f.close()
+        except Exception:
+            pass
+        # Mirror to latest.log — this is the file HR is told to send.
+        try:
+            shutil.copy2(self.path, self.latest_path)
+        except Exception:
+            pass
+
+
+class _TeeStream:
+    """Mirrors writes to both the real stdout (so the user still sees
+    them live) and the run log file (so the .log includes everything
+    the user saw). Only attached to stdout — stderr is left alone so
+    tqdm progress bars don't flood the log with carriage-return noise."""
+    def __init__(self, original, log_file):
+        self._original = original
+        self._log_file = log_file
+
+    def write(self, data):
+        try:
+            self._original.write(data)
+        except Exception:
+            pass
+        try:
+            self._log_file.write(data)
+        except Exception:
+            pass
+
+    def flush(self):
+        for f in (self._original, self._log_file):
+            try:
+                f.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        try:
+            return self._original.isatty()
+        except Exception:
+            return False
+
+    def __getattr__(self, name):
+        return getattr(self._original, name)
+
+
+def _probe_chrome_version() -> Optional[str]:
+    """Best-effort Chrome version lookup. Helpful for "but it works on
+    my machine" bug reports. Never raises."""
+    candidates = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+    ]
+    localappdata = os.environ.get('LOCALAPPDATA')
+    if localappdata:
+        candidates.insert(0, str(Path(localappdata) / 'Google' / 'Chrome' / 'Application' / 'chrome.exe'))
+    for p in candidates:
+        if Path(p).exists():
+            try:
+                out = subprocess.check_output(
+                    [p, '--version'],
+                    stderr=subprocess.STDOUT,
+                    timeout=5,
+                )
+                return out.decode('utf-8', errors='replace').strip()
+            except Exception:
+                continue
+    return None
+
+
 class IndeedDownloader:
-    def __init__(self):
+    def __init__(self, log: Optional[RunLogger] = None):
+        # Per-run structured logger. See RunLogger. If main() didn't pass
+        # one (e.g., a library caller), fall back to a no-op-ish shim so
+        # self.log calls don't have to guard for None everywhere.
+        self.log = log
         # Config from .env
         self.download_folder = os.getenv('DOWNLOAD_FOLDER', 'downloads')
         self.log_folder = os.getenv('LOG_FOLDER', 'logs')
@@ -51,10 +213,12 @@ class IndeedDownloader:
         self.cookies = {}
 
         # Current job info
-        self.current_job_id = None
+        self.current_job_id = None         # IRI from URL `selectedJobs=` (used by GraphQL)
+        self.current_job_legacy_id = None  # Short id from URL `id=` (used by /candidates/view profile URL as `legacyJobId=`)
         self.current_job_name = None
         self.current_job_folder = None
-        self.current_job_is_existing = False  # True if job folder already existed
+        self.current_manifest = None       # dict, set by _create_job_folder
+        self.current_job_identifiers = {}  # {'employer_job_id': str, 'short_id': str}
 
         # Checkpoint
         self.checkpoint_file = Path(self.log_folder) / 'checkpoint_unified.json'
@@ -77,6 +241,14 @@ class IndeedDownloader:
         self.job_mode = None  # 'single' or 'all'
         self.job_statuses = []  # ['ACTIVE', 'PAUSED', 'CLOSED']
         self.download_app_data = True  # Download screener-question HTML + raw JSON alongside CV
+        # 'auto' = tool launches + drives Chrome via Selenium (faster for users
+        # whose environment doesn't trigger Indeed's Cloudflare Turnstile block).
+        # 'attach' = tool launches Chrome as a bare subprocess with a debug port,
+        # user logs in manually (Turnstile sees a real human), then Selenium
+        # attaches to drive downloads. Slower UX but survives bot-detection.
+        self.browser_launch = 'auto'
+        self._chrome_debug_port = 9222
+        self._chrome_subprocess = None  # Popen handle for attach mode
 
     def _load_checkpoint(self) -> dict:
         """Load checkpoint data.
@@ -214,51 +386,446 @@ class IndeedDownloader:
                 print("❌ Invalid choice")
 
         print()
+        print("🖥  BROWSER LAUNCH:")
+        print("   1. Auto — the tool opens & drives Chrome for you (default)")
+        print("   2. Attach — the tool opens Chrome, YOU log in manually,")
+        print("      then the tool takes over. Use this if option 1 gave you")
+        print("      an \"unexpected error\" on the Indeed login screen.")
+        print()
+
+        while True:
+            choice = input("Choice (1/2): ").strip()
+            if choice == '1':
+                self.browser_launch = 'auto'
+                break
+            elif choice == '2':
+                self.browser_launch = 'attach'
+                break
+            else:
+                print("❌ Invalid choice")
+
+        print()
         print("=" * 60)
         print(f"✅ Mode: {self.mode.upper()}")
         print(f"✅ Jobs: {'Single' if self.job_mode == 'single' else 'All'}")
         if self.job_mode == 'all':
             print(f"✅ Statuses: {', '.join(self.job_statuses)}")
         print(f"✅ App data: {'Yes' if self.download_app_data else 'No'}")
+        print(f"✅ Browser:  {'Auto (Selenium-launched)' if self.browser_launch == 'auto' else 'Attach (manual login, bypasses bot-detection)'}")
         print("=" * 60)
         print()
 
+        if self.log:
+            self.log.event('menu', {
+                'mode': self.mode,
+                'job_mode': self.job_mode,
+                'job_statuses': self.job_statuses,
+                'download_app_data': self.download_app_data,
+                'browser_launch': self.browser_launch,
+            })
+            chrome_v = _probe_chrome_version()
+            if chrome_v:
+                self.log.info(f'Detected Chrome: {chrome_v}')
+            else:
+                self.log.warn('Could not detect installed Chrome version.')
+
+    # Pretend to be a stock Chrome on Windows 10. Matches what a real user's
+    # browser sends and avoids the "HeadlessChrome"/automation-specific UA
+    # strings Indeed's bot-guard uses as a quick-reject signal.
+    _STEALTH_USER_AGENT = (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) '
+        'Chrome/130.0.0.0 Safari/537.36'
+    )
+
+    # This script runs on EVERY new document (before any page JS), patching
+    # the handful of properties Indeed's anti-automation reads: webdriver
+    # flag, empty plugins array, missing window.chrome, etc. The one-shot
+    # execute_script we used to do is too late — Indeed checks these on
+    # the login form's first render.
+    _STEALTH_INIT_SCRIPT = r"""
+        // navigator.webdriver — the #1 Selenium tell.
+        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+        // Plugins array: real Chrome has several built-in plugins; an empty
+        // list is a common automated-browser signature.
+        Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+        // Languages: Selenium sometimes ships an empty or single-entry list.
+        Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
+        // window.chrome — real Chrome always has a runtime object on it.
+        window.chrome = window.chrome || {};
+        window.chrome.runtime = window.chrome.runtime || {};
+        // navigator.permissions.query: headless Chrome returns 'denied' for
+        // notifications while "real" Chrome returns 'prompt' — some bot
+        // checks pick up on that.
+        const origQuery = (navigator.permissions && navigator.permissions.query) || null;
+        if (navigator.permissions) {
+            navigator.permissions.query = (p) =>
+                (p && p.name === 'notifications')
+                    ? Promise.resolve({ state: Notification.permission })
+                    : (origQuery ? origQuery(p) : Promise.resolve({ state: 'granted' }));
+        }
+    """
+
     def _init_chrome(self):
-        """Initialize Chrome browser with options"""
+        """Initialize Chrome browser with anti-detection patches.
+
+        First tries undetected-chromedriver (which patches the CDP-level
+        fingerprints we can't reach from user-space Python: TLS client hello
+        ordering, process-info leaks, chromedriver binary signature). Falls
+        back to stock Selenium with our best-effort stealth init-script if
+        UC isn't importable (e.g., a minimal build environment)."""
         print("🌐 Opening Chrome...")
 
-        chrome_options = Options()
-        chrome_options.add_argument('--disable-blink-features=AutomationControlled')
-        chrome_options.add_argument('--log-level=3')
-        chrome_options.add_argument('--silent')
-        chrome_options.add_experimental_option('excludeSwitches', ['enable-automation', 'enable-logging'])
-        chrome_options.add_experimental_option('useAutomationExtension', False)
-        chrome_options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
+        self._using_uc = False
+        try:
+            import undetected_chromedriver as uc
+            # UC strips excludeSwitches / useAutomationExtension itself — in
+            # fact setting them is a tell, because real Chrome doesn't have
+            # those exclusions. So we deliberately don't pass them here.
+            uc_options = uc.ChromeOptions()
+            uc_options.add_argument('--log-level=3')
+            uc_options.add_argument('--silent')
+            uc_options.add_argument('--window-size=1920,1080')
+            uc_options.add_argument(f'--user-agent={self._STEALTH_USER_AGENT}')
+            prefs = {
+                "download.default_directory": str(Path(self.download_folder).absolute()),
+                "download.prompt_for_download": False,
+                "plugins.always_open_pdf_externally": True,
+                "credentials_enable_service": False,
+                "profile.password_manager_enabled": False,
+            }
+            uc_options.add_experimental_option("prefs", prefs)
+            # Perf log is still required by _capture_api_key.
+            uc_options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
 
-        prefs = {
-            "download.default_directory": str(Path(self.download_folder).absolute()),
-            "download.prompt_for_download": False,
-            "plugins.always_open_pdf_externally": True
-        }
-        chrome_options.add_experimental_option("prefs", prefs)
+            self.driver = uc.Chrome(options=uc_options, use_subprocess=True)
+            self._using_uc = True
+            print("   (stealth: undetected-chromedriver)")
+        except ImportError:
+            # Fallback: stock Selenium with our manual CDP stealth patches.
+            chrome_options = Options()
+            chrome_options.add_argument('--disable-blink-features=AutomationControlled')
+            chrome_options.add_argument('--log-level=3')
+            chrome_options.add_argument('--silent')
+            chrome_options.add_argument('--window-size=1920,1080')
+            chrome_options.add_argument(f'--user-agent={self._STEALTH_USER_AGENT}')
+            chrome_options.add_experimental_option('excludeSwitches', ['enable-automation', 'enable-logging'])
+            chrome_options.add_experimental_option('useAutomationExtension', False)
+            chrome_options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
+            prefs = {
+                "download.default_directory": str(Path(self.download_folder).absolute()),
+                "download.prompt_for_download": False,
+                "plugins.always_open_pdf_externally": True,
+                "credentials_enable_service": False,
+                "profile.password_manager_enabled": False,
+            }
+            chrome_options.add_experimental_option("prefs", prefs)
+            self.driver = webdriver.Chrome(options=chrome_options)
+            print("   (stealth: stock Selenium + CDP patches)")
+        except Exception as e:
+            # UC can fail to match a patched driver to the installed Chrome
+            # version, or hit a permissions issue writing its driver cache.
+            # Don't leave the user staring at a stacktrace — fall back to
+            # stock Selenium and keep going.
+            print(f"   ⚠ undetected-chromedriver failed ({e!r}); falling back to stock Selenium")
+            chrome_options = Options()
+            chrome_options.add_argument('--disable-blink-features=AutomationControlled')
+            chrome_options.add_argument('--log-level=3')
+            chrome_options.add_argument('--silent')
+            chrome_options.add_argument('--window-size=1920,1080')
+            chrome_options.add_argument(f'--user-agent={self._STEALTH_USER_AGENT}')
+            chrome_options.add_experimental_option('excludeSwitches', ['enable-automation', 'enable-logging'])
+            chrome_options.add_experimental_option('useAutomationExtension', False)
+            chrome_options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
+            prefs = {
+                "download.default_directory": str(Path(self.download_folder).absolute()),
+                "download.prompt_for_download": False,
+                "plugins.always_open_pdf_externally": True,
+                "credentials_enable_service": False,
+                "profile.password_manager_enabled": False,
+            }
+            chrome_options.add_experimental_option("prefs", prefs)
+            self.driver = webdriver.Chrome(options=chrome_options)
 
-        self.driver = webdriver.Chrome(options=chrome_options)
-        self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-        self.driver.maximize_window()
+        # Install the stealth init-script. UC applies most of this patching
+        # itself, but doubling up is harmless and covers the edge where UC
+        # missed a property. addScriptToEvaluateOnNewDocument runs on every
+        # new document before any page JS — so it's in place for the login
+        # form's first render.
+        try:
+            self.driver.execute_cdp_cmd(
+                'Page.addScriptToEvaluateOnNewDocument',
+                {'source': self._STEALTH_INIT_SCRIPT},
+            )
+        except Exception as e:
+            print(f"   ⚠ Stealth init (new-document) failed: {e!r}")
+        try:
+            self.driver.execute_cdp_cmd(
+                'Network.setUserAgentOverride',
+                {
+                    'userAgent': self._STEALTH_USER_AGENT,
+                    'acceptLanguage': 'en-US,en;q=0.9',
+                    'platform': 'Windows',
+                },
+            )
+        except Exception as e:
+            print(f"   ⚠ UA override failed: {e!r}")
+
+        # Fallback patch on the current document (about:blank) in case the
+        # CDP command above didn't register in time.
+        try:
+            self.driver.execute_script(self._STEALTH_INIT_SCRIPT)
+        except Exception:
+            pass
+
         self.wait = WebDriverWait(self.driver, 30)
 
+    # ==================== ATTACH MODE ====================
+    #
+    # Attach mode bypasses Indeed's Cloudflare Turnstile challenge. Turnstile
+    # runs invisibly on the login form and, if it decides the client is a bot,
+    # silently refuses to populate the `cf-turnstile-response` field — Indeed
+    # then returns 403 on /account/emailvalidation. Even undetected-chromedriver
+    # can't always pass Turnstile because Turnstile fingerprints at the TLS
+    # layer (JA3/JA4) and looks for warm profile history.
+    #
+    # Attach mode sidesteps all of that:
+    #   1. Launch Chrome as a plain subprocess — NO Selenium/CDP at launch
+    #      time, so Chrome is indistinguishable from a user-started browser
+    #      from Turnstile's point of view.
+    #   2. User logs in manually. Turnstile sees real human interaction and
+    #      issues its token. Indeed accepts the login, sets session cookies.
+    #   3. THEN we attach Selenium via the --remote-debugging-port the
+    #      subprocess is listening on. Indeed's API doesn't re-challenge on
+    #      subsequent calls — it just checks the session cookies.
+    #
+    # The user-data-dir is persistent under logs/chrome_profile/ so repeat
+    # runs don't require re-login until Indeed's own session expiry.
+
+    # Chrome binary lookup order. First hit wins. The "shutil.which" fallbacks
+    # at the call site cover cases where Chrome is on PATH but not at a
+    # standard install location (e.g., portable installs, work-provisioned
+    # laptops that move it).
+    _CHROME_CANDIDATE_PATHS = (
+        # Windows
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        # macOS
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        # Linux
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+    )
+
+    def _find_chrome_binary(self) -> Optional[str]:
+        """Locate a real Chrome binary for attach-mode subprocess launch.
+        Probes Windows/mac/Linux standard install paths plus %LOCALAPPDATA%
+        and PATH, returning the first one that exists."""
+        # %LOCALAPPDATA% on Windows — per-user installs land here.
+        localappdata = os.environ.get('LOCALAPPDATA')
+        if localappdata:
+            user_chrome = Path(localappdata) / 'Google' / 'Chrome' / 'Application' / 'chrome.exe'
+            if user_chrome.exists():
+                return str(user_chrome)
+
+        for p in self._CHROME_CANDIDATE_PATHS:
+            if Path(p).exists():
+                return p
+
+        for name in ('chrome', 'google-chrome', 'chromium', 'chrome.exe'):
+            found = shutil.which(name)
+            if found:
+                return found
+
+        return None
+
+    def _init_chrome_attached(self) -> bool:
+        """Launch Chrome as a detached subprocess with a debug port, wait
+        for the user to log in, then attach Selenium. Returns True on
+        success, False on unrecoverable error (user aborts, Chrome not
+        found, etc.)."""
+        print("🌐 Opening Chrome in attach mode...")
+
+        chrome_bin = self._find_chrome_binary()
+        if not chrome_bin:
+            print("❌ Could not find Chrome on this machine automatically.")
+            print("   Common paths checked: Program Files, Program Files (x86),")
+            print("   %LOCALAPPDATA%\\Google\\Chrome, and PATH.")
+            entered = input("   Paste the full path to chrome.exe (or blank to abort): ").strip().strip('"')
+            if not entered or not Path(entered).exists():
+                print("❌ No Chrome binary — aborting.")
+                return False
+            chrome_bin = entered
+
+        profile_dir = Path(self.log_folder).absolute() / "chrome_profile"
+        profile_dir.mkdir(parents=True, exist_ok=True)
+
+        # Redirect Chrome's own stderr to a file so it doesn't pollute our
+        # console. If launch fails, the log lives next to the profile for
+        # postmortem — otherwise it's benign telemetry noise.
+        chrome_log_path = profile_dir / "chrome_stderr.log"
+
+        cmd = [
+            str(chrome_bin),
+            f"--remote-debugging-port={self._chrome_debug_port}",
+            f"--user-data-dir={profile_dir}",
+            # These make the first-run experience cleaner for HR:
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-features=Translate",
+            "https://employers.indeed.com",
+        ]
+
+        try:
+            # close_fds on POSIX, no-op on Windows; keep the subprocess
+            # detached from our console so closing it doesn't kill the .exe.
+            chrome_log = open(chrome_log_path, 'ab')
+            kwargs = {
+                'stdout': subprocess.DEVNULL,
+                'stderr': chrome_log,
+                'close_fds': True,
+            }
+            if os.name == 'nt':
+                # Windows: detach the Chrome process so it survives our exit.
+                kwargs['creationflags'] = (
+                    getattr(subprocess, 'DETACHED_PROCESS', 0x00000008)
+                    | getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0x00000200)
+                )
+            self._chrome_subprocess = subprocess.Popen(cmd, **kwargs)
+        except FileNotFoundError:
+            print(f"❌ Could not execute {chrome_bin} — file not found or not executable.")
+            if self.log:
+                self.log.event('attach_launch', {'ok': False, 'reason': 'FileNotFoundError', 'chrome_bin': chrome_bin})
+            return False
+        except Exception as e:
+            print(f"❌ Failed to launch Chrome subprocess: {e!r}")
+            if self.log:
+                self.log.error('attach_launch_failed', e)
+            return False
+
+        print(f"   Chrome launched (PID {self._chrome_subprocess.pid}, profile at {profile_dir}).")
+        if self.log:
+            self.log.event('attach_launch', {
+                'ok': True,
+                'chrome_bin': chrome_bin,
+                'pid': self._chrome_subprocess.pid,
+                'debug_port': self._chrome_debug_port,
+                'profile_dir': str(profile_dir),
+            })
+        print()
+        print("=" * 60)
+        print("🔐 LOG IN MANUALLY IN THE CHROME WINDOW")
+        print("=" * 60)
+        print("   1. In the Chrome window that just opened, sign in to")
+        print("      https://employers.indeed.com as you normally would.")
+        print("   2. When you see your employer dashboard with your jobs")
+        print("      listed, come back to this console.")
+        print("   3. Press Enter here to continue.")
+        print()
+        print("   (If it's your first time using attach mode you'll log in.")
+        print("    On future runs the profile persists — you'll already be")
+        print("    logged in and can press Enter right away.)")
+        print()
+        input("Press Enter when you're on the employer dashboard...")
+
+        # Give Chrome a moment to flush the session cookies to disk before
+        # we attach. Without a short wait, get_cookies() sometimes races.
+        time.sleep(2)
+
+        # Attach Selenium to the running Chrome. The debuggerAddress tells
+        # chromedriver to connect to the existing DevTools rather than
+        # spawn its own Chrome.
+        attach_opts = Options()
+        attach_opts.add_experimental_option(
+            "debuggerAddress", f"127.0.0.1:{self._chrome_debug_port}"
+        )
+        attach_opts.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
+
+        try:
+            self.driver = webdriver.Chrome(options=attach_opts)
+        except Exception as e:
+            print(f"❌ Couldn't attach Selenium to Chrome on port {self._chrome_debug_port}: {e!r}")
+            print(f"   Check {chrome_log_path} for Chrome-side errors.")
+            return False
+
+        self.wait = WebDriverWait(self.driver, 30)
+
+        # Attach mode never sees Chrome's launch-time `prefs`, so the
+        # user's regular profile owns the download path (typically
+        # ~/Downloads). Override it before any per-job folder is set so
+        # any straggler download lands in our global folder, not the
+        # user's Documents/Downloads. _create_job_folder will narrow it
+        # further to the per-job folder once the job is selected.
+        self._point_chrome_downloads_at(Path(self.download_folder))
+
+        print(f"✅ Attached to Chrome at 127.0.0.1:{self._chrome_debug_port}")
+        return True
+
+    # A real authenticated Indeed Employer session includes these cookies.
+    # If they're missing after login, Indeed didn't actually issue a session
+    # (usually because a VPN IP triggered Cloudflare, the login form errored
+    # silently, or the user's tracking-protection stripped them). The shell
+    # of the page may still render enough DOM for _is_logged_in() to pass,
+    # but every subsequent API call will fail.
+    _ESSENTIAL_SESSION_COOKIES = ('CTK', '__Secure-PassportAuthProxy-BearerToken')
+
+    def _session_is_healthy(self, cookies: list) -> tuple:
+        """Return (ok, reason). `ok=False` means the cookie set can't sustain
+        an authenticated Indeed session — caller should not save it and
+        should not proceed into API calls."""
+        if not cookies:
+            if self.log:
+                self.log.event('session_check', {'ok': False, 'reason': 'no cookies captured'})
+            return False, "no cookies captured"
+        names = {c.get('name') for c in cookies if isinstance(c, dict)}
+        missing = [n for n in self._ESSENTIAL_SESSION_COOKIES if n not in names]
+        # Names-only logging — never log cookie values (auth tokens, PII).
+        if self.log:
+            self.log.event('session_check', {
+                'cookie_count': len(cookies),
+                'cookie_names_sample': sorted(names)[:30],
+                'missing_essentials': missing,
+                'ok': not missing and len(cookies) >= 5,
+            })
+        if missing:
+            return False, f"missing essential session cookies: {', '.join(missing)}"
+        if len(cookies) < 5:
+            return False, f"only {len(cookies)} cookies captured (expected 15+)"
+        return True, ""
+
+    def _print_vpn_remediation(self, reason: str) -> None:
+        """Shared error message for the VPN/Cloudflare-broken-session case."""
+        print(f"   ⚠ Session looks incomplete: {reason}")
+        print("   Indeed did not issue the auth cookies this login needs.")
+        print("   Most common cause is a VPN IP (NordVPN, etc.) hitting a")
+        print("   Cloudflare challenge that silently strips session cookies.")
+        print("   Try one of:")
+        print("     • Disable NordVPN (or any VPN) on this machine, then re-run.")
+        print("     • Clear Chrome's cookies for indeed.com and log in again.")
+        print("     • Switch to Frontend (Selenium) mode — option 2 at the menu.")
+
     def _load_saved_cookies(self) -> list:
-        """Load cookies from saved JSON file if it exists"""
+        """Load cookies from saved JSON file if it exists. Refuses files
+        that couldn't possibly represent a real session (too few cookies or
+        missing essentials) — those are stale artifacts of prior failed
+        runs and would confuse _is_logged_in() into a false positive."""
         cookies_file = Path(self.log_folder) / 'indeed_cookies.json'
-        if cookies_file.exists():
-            try:
-                with open(cookies_file, 'r', encoding='utf-8') as f:
-                    cookies = json.load(f)
-                if cookies and len(cookies) > 0:
-                    return cookies
-            except (json.JSONDecodeError, IOError):
-                pass
-        return []
+        if not cookies_file.exists():
+            return []
+        try:
+            with open(cookies_file, 'r', encoding='utf-8') as f:
+                cookies = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return []
+        if not cookies:
+            return []
+        ok, reason = self._session_is_healthy(cookies)
+        if not ok:
+            print(f"⚠️  Saved cookies rejected ({reason}) — treating as fresh login.")
+            return []
+        return cookies
 
     def _inject_cookies(self, cookies_list: list):
         """Inject cookies into the browser session"""
@@ -381,6 +948,53 @@ class IndeedDownloader:
 
     def setup_chrome(self) -> bool:
         """Setup Chrome and authenticate - uses saved cookies or interactive login"""
+        # Attach mode is a completely different bootstrap: Chrome is launched
+        # as a bare subprocess, the user logs in by hand, then we attach. The
+        # subprocess Chrome carries its own persistent profile under
+        # logs/chrome_profile/, so we skip cookie load/save entirely.
+        if self.browser_launch == 'attach':
+            if not self._init_chrome_attached():
+                return False
+
+            # Ensure we're on /candidates so _capture_api_key has a real
+            # GraphQL request in the network log.
+            try:
+                self.driver.get("https://employers.indeed.com/candidates")
+                time.sleep(4)
+            except Exception:
+                pass
+
+            if not self._is_logged_in():
+                print("❌ Attached Chrome isn't on the employer dashboard.")
+                print("   Make sure you logged in in the Chrome window BEFORE pressing Enter,")
+                print("   then re-run the tool.")
+                return False
+
+            # Pull CTK from the attached browser's cookie jar. (We intentionally
+            # do NOT write indeed_cookies.json in attach mode — the subprocess
+            # Chrome's persistent profile is the source of truth for that
+            # session, and duplicating it on disk would just invite drift.)
+            try:
+                for cookie in (self.driver.get_cookies() or []):
+                    if cookie.get('name') == 'CTK':
+                        self.ctk = cookie.get('value')
+                    self.cookies[cookie.get('name')] = cookie.get('value')
+            except Exception:
+                pass
+
+            self._capture_api_key()
+
+            if not self.api_key:
+                print("❌ Attached OK but couldn't capture the GraphQL API key.")
+                print("   In the Chrome window, refresh the candidates page and try again.")
+                return False
+            if not self.ctk:
+                print("⚠  CTK cookie missing from attached session — partial login?")
+                return False
+
+            print("✅ Attached session authenticated.")
+            return True
+
         self._init_chrome()
 
         # Try to load saved cookies first
@@ -397,7 +1011,19 @@ class IndeedDownloader:
             if self._is_logged_in():
                 print("✅ Logged in with saved cookies")
                 self._capture_api_key()
-                return True
+                if self.api_key:
+                    # Re-capture + re-save so short-lived tokens (bearer JWT,
+                    # __cf_bm) the browser just refreshed roll forward to the
+                    # next run. Without this the file on disk freezes at day-1
+                    # values and auth silently dies after the JWT's 1-hour TTL.
+                    fresh_cookies = self._capture_browser_cookies()
+                    if fresh_cookies:
+                        self._save_cookies(fresh_cookies)
+                    return True
+                # Hostname check passed but dashboard never issued a real
+                # GraphQL request — session is effectively dead. Fall through
+                # to manual re-login instead of proceeding with api_key=None.
+                print("⚠️  Logged-in shell detected but no GraphQL API key captured — session stale, asking for manual login")
             else:
                 print("⚠️  Cookies expired or invalid")
 
@@ -408,15 +1034,35 @@ class IndeedDownloader:
         # Give the page time to fully load after login
         time.sleep(3)
 
-        # Capture and save cookies from the authenticated session
+        # Capture cookies from the authenticated session
         cookies = self._capture_browser_cookies()
-        if cookies:
-            self._save_cookies(cookies)
-        else:
-            print("   ⚠️  No Indeed cookies captured")
+
+        # Validate the session actually received the auth cookies that make
+        # Indeed's GraphQL requests authenticated. NordVPN + Cloudflare can
+        # produce a visibly logged-in page with no session cookies set,
+        # which would pass _is_logged_in() but fail every API call.
+        ok, reason = self._session_is_healthy(cookies)
+        if not ok:
+            self._print_vpn_remediation(reason)
+            # Deliberately do NOT save the partial cookie file — it would
+            # be loaded on the next run and short-circuit back to the same
+            # false-positive logged-in state.
+            return False
+
+        self._save_cookies(cookies)
 
         # Navigate to candidates page and capture API key
         self._capture_api_key()
+
+        if not self.api_key:
+            print("❌ Authentication looked OK (cookies present) but no GraphQL API key")
+            print("   appeared in the Chrome performance log.")
+            print("   Indeed may be throttling this session or their frontend changed.")
+            print("   Try one of:")
+            print("     • Quit Chrome fully (all windows) and re-run.")
+            print("     • Disable any VPN/proxy and re-run.")
+            print("     • Switch to Frontend (Selenium) mode — option 2 at the menu.")
+            return False
 
         print("✅ Authentication successful!")
         return True
@@ -445,8 +1091,47 @@ class IndeedDownloader:
 
             if self.api_key:
                 print(f"   ✅ API Key captured")
-        except Exception:
-            pass
+                if self.log:
+                    self.log.event('api_key_capture', {'ok': True})
+            else:
+                print(f"   ⚠ API key NOT captured — performance log had no graphql request to apis.indeed.com (session likely unauthenticated)")
+                if self.log:
+                    # Also log a sample of URLs the performance log DID contain,
+                    # so we can tell "page never loaded" from "page loaded but
+                    # didn't hit apis.indeed.com" in post-mortem.
+                    try:
+                        sample_urls = []
+                        for log in (self.driver.get_log('performance') or [])[:200]:
+                            try:
+                                m = json.loads(log['message'])['message']
+                                if m.get('method') == 'Network.requestWillBeSent':
+                                    # Path only. This branch fires when auth did
+                                    # NOT complete, i.e. exactly when the perf
+                                    # log is full of login-flow URLs and exactly
+                                    # when HR is most likely to send this file.
+                                    # Truncating to 140 chars was not redaction:
+                                    # the real URLs put indeedcsrftoken well
+                                    # inside the first 140 characters. The
+                                    # question this answers is "did anything
+                                    # reach apis.indeed.com", which needs no
+                                    # query string.
+                                    parsed_u = urlparse(m['params']['request']['url'])
+                                    sample_urls.append(
+                                        parsed_u._replace(query='', fragment='').geturl()[:140]
+                                    )
+                            except (KeyError, json.JSONDecodeError):
+                                continue
+                        self.log.event('api_key_capture', {
+                            'ok': False,
+                            'url_sample': sample_urls[:20],
+                            'total_perf_entries': len(sample_urls),
+                        })
+                    except Exception:
+                        self.log.event('api_key_capture', {'ok': False})
+        except Exception as e:
+            print(f"   ⚠ API-key capture threw: {e!r}")
+            if self.log:
+                self.log.error('api_key_capture_exception', e)
 
     def _clean_job_title(self, title: str) -> str:
         """Clean the job title to produce a valid folder name"""
@@ -492,26 +1177,112 @@ class IndeedDownloader:
                 pass
         return None
 
-    def _create_job_folder(self, job_name: str, job_date: str = None) -> Path:
-        """Create folder for job with name and date"""
-        # Clean job name for folder
-        safe_name = self._clean_job_title(job_name)
-        safe_name = safe_name[:80]  # Limit length
+    def _create_job_folder(self, job_name: str, job_date: str = None,
+                           employer_job_id: str = None, short_id: str = None) -> Path:
+        """Resolve (or create) this job's folder and load its manifest.
 
-        if job_date:
-            folder_name = f"{safe_name} ({job_date})"
+        Identity comes from the Indeed job id via the manifest, so a job
+        downloaded once in single-job mode and again in all-jobs mode lands
+        in the same folder even though the two modes name folders
+        differently. Falls back to name-and-date only for folders written
+        by an older build.
+        """
+        today = time.strftime('%Y-%m-%d')
+        self.current_job_identifiers = {
+            'employer_job_id': employer_job_id or '',
+            'short_id': short_id or '',
+        }
+
+        safe_name = self._clean_job_title(job_name)[:80]
+
+        # 1. By Indeed job id via the manifest — exact, name-independent.
+        job_folder = manifest_mod.resolve_job_folder(
+            Path(self.download_folder), employer_job_id, short_id
+        )
+        # 2. By name, for folders an older build wrote with no manifest.
+        if job_folder is None:
+            job_folder = manifest_mod.resolve_legacy_folder_by_name(
+                Path(self.download_folder), safe_name, job_date
+            )
+            if job_folder is not None:
+                print(f"   Adopting existing folder: {job_folder.name}")
+        # 3. Otherwise a new folder.
+        if job_folder is None:
+            folder_name = f"{safe_name} ({job_date})" if job_date else safe_name
+            job_folder = Path(self.download_folder) / folder_name
+
+        job_folder.mkdir(parents=True, exist_ok=True)
+
+        job_meta = {
+            'title': job_name,
+            'posted_date': job_date or '',
+            'employer_job_id': employer_job_id or '',
+            'short_id': short_id or '',
+        }
+
+        loaded = manifest_mod.load(job_folder)
+        if manifest_mod.needs_backfill(loaded):
+            # Keep the run history and the job identity the empty manifest
+            # already carried — backfill_from_disk starts from new_manifest,
+            # which REPLACES the job block wholesale rather than merging it.
+            #
+            # The job block matters most: a frontend re-run lands on a
+            # /candidates/view URL, so job_meta carries '' for both ids (the
+            # profile-view guard below correctly refuses the candidate's id).
+            # Replacing would erase the short_id an earlier run stored, and
+            # resolve_job_folder matches on ids alone — this folder would
+            # silently drop to name-and-date matching forever after.
+            #
+            # Hence merge, stored block as the base, and let only non-empty
+            # job_meta values overwrite: a later run holding real identifiers
+            # can still upgrade the block, an id-less one cannot erase it.
+            previous_runs = loaded.get('runs', []) if loaded else []
+            previous_job = dict(loaded.get('job') or {}) if loaded else {}
+            loaded = manifest_mod.backfill_from_disk(job_folder, job_meta, today)
+            loaded['runs'] = previous_runs + loaded['runs']
+            previous_job.update({k: v for k, v in job_meta.items() if v})
+            loaded['job'] = previous_job
+            recovered = len(loaded['candidates'])
+            if recovered:
+                print(f"   Recovered {recovered} existing candidates from disk")
         else:
-            folder_name = safe_name
+            loaded['job'].update({k: v for k, v in job_meta.items() if v})
 
-        job_folder = Path(self.download_folder) / folder_name
-
-        # Check if folder already exists (has PDFs)
-        self.current_job_is_existing = job_folder.exists() and any(job_folder.rglob('*.pdf'))
-
-        job_folder.mkdir(exist_ok=True)
+        self.current_manifest = loaded
+        manifest_mod.save(job_folder, self.current_manifest)
 
         self.current_job_folder = job_folder
+        self._point_chrome_downloads_at(job_folder)
         return job_folder
+
+    def _point_chrome_downloads_at(self, folder: Path) -> None:
+        """Repoint Chrome's download directory at `folder` via CDP.
+
+        Why CDP instead of Chrome `prefs`: the prefs path is set once at
+        Chrome launch, can't be changed afterwards, and isn't honored at all
+        in attach mode (the user's pre-existing Chrome profile owns the
+        download path there). Page.setDownloadBehavior overrides at runtime
+        and works identically in auto and attach mode.
+
+        Without this, the app-data modal flow's "Download files" click drops
+        files into Chrome's default location (e.g., C:\\Users\\<user>\\Downloads
+        in attach mode), but `_move_application_files` looks in
+        `current_job_folder` — so they never get matched and `step: "files"`
+        always fails. See logs/run_20260429_141424.log for the 5/5 failure
+        that motivated this fix.
+        """
+        if self.driver is None:
+            return
+        try:
+            self.driver.execute_cdp_cmd(
+                'Page.setDownloadBehavior',
+                {'behavior': 'allow', 'downloadPath': str(folder.absolute())},
+            )
+            if self.log:
+                self.log.event('chrome_download_path_set', {'path': str(folder.absolute())})
+        except Exception as e:
+            if self.log:
+                self.log.event('chrome_download_path_failed', {'err': repr(e)})
 
     def _close_modals(self):
         """Close any modal/popup that might be open"""
@@ -568,22 +1339,47 @@ class IndeedDownloader:
     # ==================== BACKEND MODE (API) ====================
 
     def fetch_candidates_api(self, offset: int = 0, limit: int = 100, dispositions: list = None, sort_by: str = "APPLY_DATE", sort_order: str = "DESCENDING"):
-        """Fetch candidates using GraphQL API via browser"""
+        """Fetch candidates using GraphQL API via browser.
+
+        Returns (matches, total, has_next_page, ok).
+
+        `ok` is the whole point. Every other return value is identical for a
+        query that FAILED and a job that is genuinely EMPTY — both are
+        ([], 0, False) — and every guard downstream was built on that
+        ambiguity. A total failure in single-job mode reached "All CVs are
+        already downloaded!" because total_expected came back 0, so the two
+        checks that would have caught it (`== 0 and expected > 0`, then
+        `fetched < expected`) both short-circuited.
+
+        Callers must treat ok=False as "this pass told us nothing", never as
+        "there is nothing here".
+        """
+        # legacyID lives on 5 distinct CandidateSubmission union types; missing
+        # any of them drops that candidate silently (legacyID becomes None and
+        # the downstream filter skips it). Keep all 5 in sync with the live
+        # dashboard request — see indeed_graphql_1.txt / indeed_graphql_2.txt.
         query = """query FindRCPMatches($input: OrchestrationMatchesInput!) {
   findRCPMatches(input: $input) {
     overallMatchCount
     matchConnection {
-      pageInfo { hasNextPage }
+      pageInfo { hasNextPage hasPreviousPage }
       matches {
         candidateSubmission {
           id
           data {
+            __typename
             profile { name { displayName } }
             resume {
-              ... on CandidatePdfResume { id, downloadUrl }
+              ... on CandidatePdfResume { id downloadUrl txtDownloadUrl }
+              ... on CandidateHtmlFile { id downloadUrl }
+              ... on CandidateTxtFile { id downloadUrl }
+              ... on CandidateUnrenderableFile { id downloadUrl }
             }
+            ... on LegacyCandidateSubmission { legacyID }
             ... on IndeedApplyCandidateSubmission { legacyID }
             ... on EmployerGeneratedCandidateSubmission { legacyID }
+            ... on HiddenIndeedApplyCandidateSubmission { legacyID }
+            ... on HiddenEmployerGeneratedCandidateSubmission { legacyID }
           }
         }
       }
@@ -591,12 +1387,27 @@ class IndeedDownloader:
   }
 }"""
 
+        # The 6 active-pipeline dispositions — proven to work by live
+        # capture. Post-active states (REJECTED / WITHDRAWN / HIRED /
+        # AUTO_REJECTED) are fetched SEPARATELY in isolated passes by
+        # _download_all_candidates_api so a single rejected enum value can't
+        # blow up the entire run with AllMatchProvidersFailedException.
         if dispositions is None:
             dispositions = ["NEW", "PENDING", "PHONE_SCREENED", "INTERVIEWED", "OFFER_MADE", "REVIEWED"]
 
         surface_context = [{"contextKey": "DISPOSITION", "contextPayload": d} for d in dispositions]
         surface_context.append({"contextKey": "SORT_BY", "contextPayload": sort_by})
         surface_context.append({"contextKey": "SORT_ORDER", "contextPayload": sort_order})
+
+        # Indeed's schema declares `identifiers: OrchestrationIdentifiersInput!`
+        # (non-null) — omitting the field yields
+        # "missing input value at `$input.identifiers`" and 0 results, as
+        # seen in logs/run_20260421_204255.log. The live dashboard ALWAYS
+        # sends this key, using an empty `jobIdentifiers` dict for unscoped
+        # queries (see indeed_graphql_1.txt). Match that shape here.
+        job_identifiers = {}
+        if self.current_job_id:
+            job_identifiers["employerJobId"] = self.current_job_id
 
         variables = {
             "input": {
@@ -607,16 +1418,26 @@ class IndeedDownloader:
                 "context": {
                     "surfaceContext": surface_context
                 },
-                "searchSessionId": f"dl-{int(time.time())}-{offset}"
+                "identifiers": {"jobIdentifiers": job_identifiers},
             }
         }
 
-        if self.current_job_id:
-            variables["input"]["identifiers"] = {
-                "jobIdentifiers": {"employerJobId": self.current_job_id}
-            }
-
         payload = {"operationName": "FindRCPMatches", "variables": variables, "query": query}
+
+        # One-time query-shape log per pagination run, to aid diagnosis without
+        # being noisy. Printed only on offset=0.
+        if offset == 0:
+            scope = f"employerJobId={self.current_job_id[:24]}..." if self.current_job_id else "unscoped (all jobs)"
+            print(f"   🔎 Query: {scope}, dispositions={len(dispositions)}, limit={limit}")
+
+        # Abort early on missing auth instead of sending the literal string
+        # "None" as the indeed-api-key header (Python f-string would stringify
+        # None). That produced Indeed's "An API Key is required" error which
+        # HR was hitting after saved cookies went stale.
+        if not self.api_key or not self.ctk:
+            print("❌ Aborting: missing indeed-api-key or CTK (auth did not complete).")
+            print("   Delete logs/indeed_cookies.json and re-run to log in fresh.")
+            return [], 0, False, False
 
         js_code = f"""
         return await fetch("https://apis.indeed.com/graphql?co=US&locale=en-US", {{
@@ -636,25 +1457,86 @@ class IndeedDownloader:
 
         try:
             result = self.driver.execute_script(js_code)
-            if not result or 'errors' in result:
-                return [], 0
+            if not result:
+                print(f"   ⚠ GraphQL returned no response (auth may have expired)")
+                return [], 0, False, False
+            if 'errors' in result:
+                print(f"   ⚠ GraphQL errors from Indeed:")
+                msgs = []
+                for err in (result.get('errors') or [])[:3]:
+                    msg = err.get('message', str(err)) if isinstance(err, dict) else str(err)
+                    print(f"      • {msg}")
+                    msgs.append(msg)
+                if self.log:
+                    self.log.event('graphql_error', {
+                        'messages': msgs,
+                        'has_api_key': bool(self.api_key),
+                        'has_ctk': bool(self.ctk),
+                        'dispositions': dispositions,
+                        'offset': offset,
+                    })
+                return [], 0, False, False
 
-            matches = result.get('data', {}).get('findRCPMatches', {}).get('matchConnection', {}).get('matches', [])
-            total = result.get('data', {}).get('findRCPMatches', {}).get('overallMatchCount', 0)
-            return matches, total
+            rcp = result.get('data', {}).get('findRCPMatches', {}) or {}
+            conn = rcp.get('matchConnection', {}) or {}
+            matches = conn.get('matches', []) or []
+            total = rcp.get('overallMatchCount', 0) or 0
+            has_next_page = bool((conn.get('pageInfo') or {}).get('hasNextPage'))
+            if offset == 0:
+                print(f"   🔎 Server returned: overallMatchCount={total}, matches_on_page={len(matches)}, hasNextPage={has_next_page}")
+            return matches, total, has_next_page, True
         except Exception as e:
             print(f"❌ API error: {e}")
-            return [], 0
+            return [], 0, False, False
+
+    def _candidate_folder_for(self, name: str, candidate: dict = None) -> Path:
+        """Resolve (and create) one candidate's folder, consistently.
+
+        download_cv_api has the API dict and keys on the legacyID. The
+        app-data pass and the Selenium path see a display name only, so they
+        look the key up by name first. Without that lookup the two flows
+        allocate different folders and the screener Q&A files land away from
+        the resume.
+
+        The allocation is recorded before it is returned. allocate_candidate_folder
+        reserves nothing — it derives the suffix from the manifest and from what
+        is already on disk, so a folder nobody recorded is indistinguishable
+        from a folder written by the Selenium path, and gets skipped as if it
+        belonged to someone else. An applicant with no resume is recorded with
+        folder=None, so without this their app-data folder would move to
+        "(2)", "(3)" on each run, stranding earlier screener answers.
+
+        has_cv is carried through untouched: it drives no_cv.txt and drives
+        whether diff() re-fetches, and writing screener answers is not evidence
+        that a resume arrived.
+        """
+        if candidate is not None:
+            key = manifest_mod.entry_key(candidate)
+        else:
+            key = (manifest_mod.find_key_by_name(self.current_manifest, name)
+                   or manifest_mod.NOKEY_PREFIX + manifest_mod.normalize_name(name))
+        folder = manifest_mod.allocate_candidate_folder(
+            self.current_job_folder, self.current_manifest, key, name
+        )
+
+        entry = self.current_manifest['candidates'].get(key)
+        if not entry or entry.get('folder') != folder.name:
+            manifest_mod.record(
+                self.current_manifest, key,
+                (entry or {}).get('name') or name,
+                folder.name,
+                bool(entry and entry.get('has_cv')),
+                time.strftime('%Y-%m-%d'),
+            )
+            manifest_mod.save(self.current_job_folder, self.current_manifest)
+
+        return folder
 
     def download_cv_api(self, candidate: dict) -> bool:
         """Download CV via API"""
         name = candidate['name']
         legacy_id = candidate['legacy_id']
         download_url = candidate['download_url']
-
-        if legacy_id in self.checkpoint_data['downloaded_ids']:
-            self.stats['skipped'] += 1
-            return True
 
         try:
             js_code = f"""
@@ -684,13 +1566,21 @@ class IndeedDownloader:
 
             pdf_data = base64.b64decode(base64_data)
 
-            candidate_folder = self._create_candidate_folder(name)
+            key = manifest_mod.entry_key(candidate)
+            candidate_folder = self._candidate_folder_for(name, candidate)
             filepath = candidate_folder / "resume.pdf"
 
             with open(filepath, 'wb') as f:
                 f.write(pdf_data)
 
-            if filepath.stat().st_size > 1000:
+            if filepath.stat().st_size > manifest_mod.MIN_RESUME_BYTES:
+                manifest_mod.record(
+                    self.current_manifest, key, name, candidate_folder.name,
+                    True, time.strftime('%Y-%m-%d'),
+                )
+                # Persist after every candidate so a killed run resumes
+                # exactly where it stopped — the guarantee HR_GUIDE makes.
+                manifest_mod.save(self.current_job_folder, self.current_manifest)
                 self._save_checkpoint(name=name, legacy_id=legacy_id)
                 self.stats['downloaded'] += 1
                 return True
@@ -706,106 +1596,145 @@ class IndeedDownloader:
     def run_backend_single_job(self):
         """Run backend mode for single job"""
         print("\n" + "=" * 60)
-        print("👆 Navigate to the desired job in Chrome")
-        print("   then press Enter")
+        print("👆 Navigate to the desired job in Chrome, then press Enter.")
+        print("   Tip: click the job title in your Jobs list — you should land")
+        print("   on THAT JOB's candidates page. The global 'All Candidates'")
+        print("   view (statusName=All) won't work; pick one specific job.")
         print("=" * 60)
         input()
 
         job_url = self.driver.current_url
         self.current_job_id = self._extract_job_id_from_url(job_url)
+        # Also pull the SHORT job id from the `id=` query param on the list
+        # URL. It's the same identifier Indeed surfaces as `legacyJobId=` on
+        # /candidates/view profile URLs — needed by the app-data pass to load
+        # individual candidate profiles. Distinct from `selectedJobs=` (IRI)
+        # and from any candidate `id=` you'd see on a profile URL. `id=0` is
+        # the All-Candidates pipeline marker (Single-mode guard rejects that
+        # case anyway via the missing `selectedJobs=`).
+        self.current_job_legacy_id = None
+        try:
+            params = parse_qs(urlparse(job_url).query)
+            short_id = params.get('id', [None])[0]
+            if short_id and short_id != '0':
+                self.current_job_legacy_id = short_id
+        except (ValueError, KeyError, IndexError):
+            pass
 
-        # Get job name from page
+        # Diagnostic snapshot — prints once per run, helps trace any
+        # "0 candidates" failure to its actual cause (bad URL extraction,
+        # missing auth token, wrong scope, etc).
+        print(f"\n🔎 Diagnostics:")
+        print(f"   URL: {job_url}")
+        print(f"   Extracted job IRI: {self.current_job_id or '(none)'}")
+        print(f"   Job legacy id:     {self.current_job_legacy_id or '(none — app-data pass may fall back)'}")
+        # Both are truncated. Every print() is teed into the run log, and the
+        # tool then tells HR to send that file when something breaks — so a
+        # full value here walks a live session credential into an email or a
+        # Teams thread. The diagnostic question is "did we get one", which a
+        # prefix answers. CTK used to be printed in full.
+        print(f"   API key: {self.api_key[:12] + '...' if self.api_key else '(MISSING — auth may have failed)'}")
+        print(f"   CTK:     {self.ctk[:6] + '...' if self.ctk else '(MISSING — auth may have failed)'}")
+
+        # Single-mode guard: if we couldn't pull a job IRI from the URL, bail
+        # out instead of silently falling through to an unscoped GraphQL
+        # query — that path (a) isn't what the user asked for in Single mode,
+        # (b) dumps everything into `Job_unknown/`, and (c) used to crash on
+        # Indeed's schema because `identifiers` is required. First seen in
+        # logs/run_20260421_204255.log where HR was on `?statusName=All&id=0`.
+        if not self.current_job_id:
+            print("\n❌ Single-job mode needs a specific job.")
+            print("   Your URL doesn't include `selectedJobs=...`, which means")
+            print("   you're probably on the global 'All Candidates' pipeline")
+            print("   instead of one job's candidate list.")
+            print("\n   What to do:")
+            print("   1. In Chrome, go back to your Jobs list.")
+            print("   2. Click the job title you want to download.")
+            print("   3. Confirm the URL looks like:")
+            print("         employers.indeed.com/candidates?selectedJobs=aXJp...")
+            print("   4. Re-run the tool.")
+            print("\n   (If your URL uses `employerJobId=` or some other parameter")
+            print("    instead of `selectedJobs=`, send the full URL to Pawel —")
+            print("    the parser may need an update for your account shape.)")
+            if self.log:
+                self.log.event('single_job_abort', {
+                    'reason': 'no_job_iri_in_url',
+                    'url': job_url,
+                    'has_api_key': bool(self.api_key),
+                    'has_ctk': bool(self.ctk),
+                })
+            return
+
+        # Get job name from page. The first selector the page exposes may be
+        # the generic "Candidates" h1 (not the job title) depending on which
+        # subpage HR navigated to; in that case we fall back to a stable
+        # label derived from the job's UUID so different jobs don't collide
+        # into one folder.
         try:
             job_name = self.driver.execute_script("""
                 const el = document.querySelector('[data-testid="job-title"]') ||
                            document.querySelector('h1') ||
                            document.querySelector('.job-title');
-                return el ? el.textContent.trim() : 'Job';
+                return el ? el.textContent.trim() : '';
             """)
-            self._create_job_folder(job_name)
-            print(f"📁 Folder: {self.current_job_folder}")
         except Exception:
-            pass
+            job_name = ''
+
+        generic_names = {'', 'candidates', 'applicants', 'all candidates', 'job'}
+        if (job_name or '').strip().lower() in generic_names:
+            fallback = 'Job_unknown'
+            if self.current_job_id:
+                try:
+                    # selectedJobs is base64-encoded `iri://apis.indeed.com/EmployerJob/<uuid>`
+                    decoded = base64.b64decode(self.current_job_id + '===').decode('utf-8', errors='ignore')
+                    uuid_tail = decoded.rsplit('/', 1)[-1][:8]
+                    if uuid_tail:
+                        fallback = f"Job_{uuid_tail}"
+                except Exception:
+                    pass
+            print(f"   (page title was generic — using fallback folder name '{fallback}')")
+            job_name = fallback
+
+        try:
+            # No posting date is available on the candidates page. That is
+            # fine: the manifest carries the job id, so a later all-jobs run
+            # resolves to this same folder even though it would have named a
+            # new one "<title> (DD-MM-YYYY)".
+            self._create_job_folder(
+                job_name, None,
+                employer_job_id=self.current_job_id,
+                short_id=self.current_job_legacy_id,
+            )
+            print(f"📁 Folder: {self.current_job_folder}")
+        except Exception as e:
+            print(f"❌ Could not prepare the job folder: {e!r}")
+            if self.log:
+                self.log.event('single_job_folder_failed', {'err': repr(e)})
+            return
 
         self._download_all_candidates_api()
 
-    def _load_job_checkpoint(self, scan_pdfs: bool = False) -> tuple:
-        """Load checkpoint for current job folder - returns (downloaded_ids, downloaded_names)
-
-        Args:
-            scan_pdfs: If True, scan existing PDF files for names (for existing jobs with new candidates)
-        """
-        downloaded_ids = set(self.checkpoint_data.get('downloaded_ids', []))
-        downloaded_names = set(self.checkpoint_data.get('downloaded_names', []))
-
-        if not self.current_job_folder:
-            return downloaded_ids, downloaded_names
-
-        # Load from job-specific checkpoint if exists
-        job_checkpoint_file = self.current_job_folder / 'checkpoint.json'
-        if job_checkpoint_file.exists():
-            try:
-                with open(job_checkpoint_file, 'r', encoding='utf-8') as f:
-                    job_data = json.load(f)
-                    downloaded_ids.update(job_data.get('downloaded_ids', []))
-                    downloaded_names.update(job_data.get('downloaded_names', []))
-            except (json.JSONDecodeError, IOError):
-                pass
-
-        # Scan existing PDF files to get names (only for existing jobs with new candidates)
-        if scan_pdfs:
-            print("   Scanning existing CVs...")
-            for pdf_file in self.current_job_folder.rglob('*.pdf'):
-                # Format: "Jean Dupont_20251126_154317.pdf"
-                name_part = pdf_file.stem.rsplit('_', 2)[0]  # Get "Jean Dupont"
-                if name_part:
-                    downloaded_names.add(name_part.lower())
-            print(f"   {len(downloaded_names)} names found in existing files")
-
-        return downloaded_ids, downloaded_names
-
-    def _save_job_checkpoint(self, legacy_id: str, name: str = None):
-        """Save checkpoint for current job folder"""
-        if not self.current_job_folder:
-            return
-
-        job_checkpoint_file = self.current_job_folder / 'checkpoint.json'
-
-        # Load existing
-        job_data = {'downloaded_ids': [], 'downloaded_names': []}
-        if job_checkpoint_file.exists():
-            try:
-                with open(job_checkpoint_file, 'r', encoding='utf-8') as f:
-                    job_data = json.load(f)
-                    if 'downloaded_names' not in job_data:
-                        job_data['downloaded_names'] = []
-            except (json.JSONDecodeError, IOError):
-                pass
-
-        # Add new id
-        if legacy_id and legacy_id not in job_data['downloaded_ids']:
-            job_data['downloaded_ids'].append(legacy_id)
-
-        # Add new name
-        if name:
-            clean_name = "".join(c for c in name if c.isalnum() or c in (' ', '-', '_')).strip().lower()
-            if clean_name and clean_name not in job_data['downloaded_names']:
-                job_data['downloaded_names'].append(clean_name)
-
-        # Save
-        with open(job_checkpoint_file, 'w', encoding='utf-8') as f:
-            json.dump(job_data, f, ensure_ascii=False, indent=2)
-
     def _fetch_candidates_batch(self, dispositions: list, sort_by: str = "APPLY_DATE", sort_order: str = "DESCENDING") -> tuple:
-        """Fetch candidates with specific filters, returns (candidates_list, total_count)"""
+        """Fetch every page for one disposition set.
+
+        Returns (candidates_list, total_count, ok). `ok` is False if ANY page
+        failed, because a partial list is not a short list — it is a list the
+        caller must not reconcile against a total or feed to mark_stale.
+
+        A failure mid-pagination previously broke the loop exactly like
+        reaching the end, so the caller received a truncated list it believed
+        was complete.
+        """
         all_candidates = {}  # Use dict to dedupe by legacy_id
         offset = 0
         total_announced = 0
+        limit = 100
+        ok = True
 
         while True:
-            matches, total = self.fetch_candidates_api(
+            matches, total, has_next_page, page_ok = self.fetch_candidates_api(
                 offset=offset,
-                limit=100,
+                limit=limit,
                 dispositions=dispositions,
                 sort_by=sort_by,
                 sort_order=sort_order
@@ -813,6 +1742,10 @@ class IndeedDownloader:
 
             if offset == 0:
                 total_announced = total
+
+            if not page_ok:
+                ok = False
+                break
 
             if not matches:
                 break
@@ -835,12 +1768,52 @@ class IndeedDownloader:
                 except (KeyError, TypeError):
                     continue
 
-            if len(matches) < 100:
+            if not has_next_page:
                 break
-            offset += 100
+
+            # Advance by what the server actually returned, not by what we
+            # asked for. A fixed +100 stride silently skips (100 - actual)
+            # records on every page if Indeed ever clamps the page size while
+            # still reporting hasNextPage. The live dashboard requests 20.
+            if len(matches) < limit:
+                print(f"   ⚠ Server returned {len(matches)} of {limit} requested "
+                      f"but reports more pages — advancing by {len(matches)}.")
+                if self.log:
+                    self.log.event('page_size_clamped', {
+                        'requested': limit, 'returned': len(matches),
+                        'offset': offset, 'dispositions': dispositions,
+                    })
+            offset += len(matches)
             time.sleep(0.3)
 
-        return list(all_candidates.values()), total_announced
+        return list(all_candidates.values()), total_announced, ok
+
+    def _finalize_job_manifest(self, total_announced: int, total_recovered: int,
+                               all_candidates_list: list, downloaded: int) -> None:
+        """Persist manifest, regenerate no_cv.txt, append the run record.
+
+        Called on every path that completes a job, including the one where
+        there was nothing new to fetch.
+        """
+        if not self.current_job_folder or self.current_manifest is None:
+            return
+        today = time.strftime('%Y-%m-%d')
+        manifest_mod.mark_stale(self.current_manifest, all_candidates_list, today)
+        self.current_manifest['runs'].append({
+            'at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+            'announced': total_announced,
+            'fetched': total_recovered,
+            'new': downloaded,
+        })
+        manifest_mod.save(self.current_job_folder, self.current_manifest)
+        manifest_mod.write_no_cv(self.current_job_folder, self.current_manifest)
+        # stats.json stays for the end-of-run report, which reads only
+        # total_announced and total_recovered (see _generate_report). The
+        # `processed` value is the cumulative manifest size — it counts stale
+        # and unmatched backfill entries, so it is NOT bounded by
+        # total_recovered and must never be compared against it.
+        self._save_job_stats(total_announced, total_recovered,
+                             len(self.current_manifest['candidates']))
 
     def _download_all_candidates_api(self, job_total_candidates: int = 0):
         """Download all candidates via API with multiple passes to bypass 3000 limit
@@ -850,17 +1823,96 @@ class IndeedDownloader:
         """
         print("\nFetching candidates via API...")
 
-        # All disposition types
-        all_dispositions = ["NEW", "PENDING", "PHONE_SCREENED", "INTERVIEWED", "OFFER_MADE", "REVIEWED"]
+        # Active-pipeline dispositions — the combination proven safe by live
+        # capture. Sent together in a single query.
+        active_dispositions = ["NEW", "PENDING", "PHONE_SCREENED", "INTERVIEWED", "OFFER_MADE", "REVIEWED"]
+
+        # Post-active dispositions — each sent in its OWN query so a single
+        # unsupported enum value produces an AllMatchProvidersFailedException
+        # on that one pass only, rather than killing the whole run.
+        extra_dispositions = ["REJECTED", "AUTO_REJECTED", "WITHDRAWN", "HIRED"]
+
+        # Full list used by the large-volume fallback (Pass 5 below).
+        all_dispositions = active_dispositions + extra_dispositions
         all_candidates = {}  # key: legacy_id, value: candidate dict
 
-        # Pass 1: Sort by date DESC (default)
-        print("   Fetching candidates...")
-        candidates, api_total = self._fetch_candidates_batch(all_dispositions, "APPLY_DATE", "DESCENDING")
+        # Pass 1: active pipeline, sort by date DESC (default view).
+        print("   Fetching candidates (active pipeline)...")
+        candidates, api_total, active_ok = self._fetch_candidates_batch(active_dispositions, "APPLY_DATE", "DESCENDING")
         for c in candidates:
             if c['legacy_id'] not in all_candidates:
                 all_candidates[c['legacy_id']] = c
-        print(f"      {len(all_candidates)} fetched")
+        active_fetched = len(all_candidates)
+        print(f"      {active_fetched} fetched")
+
+        # The active pass is the one that carries the announced total. If it
+        # failed we know nothing about this job — not that it is empty — so
+        # stop before anything writes a manifest, a stats file, a report line,
+        # or the words "All CVs are already downloaded". Continuing here is
+        # what let a dead session be reported to HR as a finished job.
+        if not active_ok:
+            print("\n   ❌ Could not read this job's applicant list — the request failed.")
+            print("      This is NOT the same as the job having no applicants.")
+            print("      Nothing has been changed on disk. Common causes:")
+            print("        • Your Indeed session expired — delete logs/indeed_cookies.json and re-run")
+            print("        • Indeed is throttling — wait a few minutes and re-run")
+            self.stats['failed_jobs'] = self.stats.get('failed_jobs', 0) + 1
+            if self.log:
+                self.log.event('active_pass_failed', {
+                    'dispositions': active_dispositions,
+                    'announced': api_total,
+                    'fetched': active_fetched,
+                })
+            return
+
+        # Pass 1.5: each post-active disposition in isolation, so one
+        # unsupported enum value fails its own pass instead of the whole run.
+        #
+        # A failed pass is reported, not swallowed. AUTO_REJECTED and WITHDRAWN
+        # both return AllMatchProvidersFailedException on every real run against
+        # this account — with valid auth — and the old code printed nothing at
+        # all for them, because a failed pass and an empty one both arrived as
+        # (0 new, 0 announced). Indeed auto-rejects anyone who fails a knock-out
+        # screener question, so those applicants exist, are absent from every
+        # folder, and were absent from every count HR had ever seen.
+        unreadable = []
+        reconciliation = [('active pipeline', api_total, active_fetched)]
+        for d in extra_dispositions:
+            extra_candidates, extra_total, extra_ok = self._fetch_candidates_batch([d], "APPLY_DATE", "DESCENDING")
+            new_count = 0
+            for c in extra_candidates:
+                if c['legacy_id'] not in all_candidates:
+                    all_candidates[c['legacy_id']] = c
+                    new_count += 1
+            if not extra_ok:
+                unreadable.append(d)
+                print(f"      ⚠ {d}: could not be read — any applicants in this "
+                      f"group are NOT in this folder")
+                continue
+            reconciliation.append((d, extra_total, len(extra_candidates)))
+            if new_count > 0 or extra_total > 0:
+                print(f"      +{new_count} {d} (server reported {extra_total})")
+
+        # Reconcile per pass. The old check compared an active-only denominator
+        # against an all-disposition numerator ("Total expected: 16 | Fetched:
+        # 20" on a real run), so `fetched < expected` could not fire even when
+        # the active pass genuinely dropped people.
+        for label, announced, fetched in reconciliation:
+            if announced > 0 and fetched < announced:
+                print(f"      ⚠ {label}: Indeed reported {announced} but only "
+                      f"{fetched} could be fetched ({announced - fetched} missing)")
+                if self.log:
+                    self.log.event('pass_under_fetched', {
+                        'pass': label, 'announced': announced, 'fetched': fetched,
+                    })
+
+        if unreadable:
+            self._unreadable_dispositions = list(unreadable)
+            print(f"\n   ⚠ {len(unreadable)} applicant group(s) could not be read: "
+                  f"{', '.join(unreadable)}")
+            print(f"      The counts below exclude them.")
+            if self.log:
+                self.log.event('dispositions_unreadable', {'dispositions': unreadable})
 
         # Use job_total_candidates if available (more accurate), otherwise use API total
         total_expected = job_total_candidates if job_total_candidates > 0 else api_total
@@ -874,7 +1926,7 @@ class IndeedDownloader:
 
             # Pass 2: Sort by date ASC
             print("   Pass 2: By date (oldest -> newest)...")
-            candidates, _ = self._fetch_candidates_batch(all_dispositions, "APPLY_DATE", "ASCENDING")
+            candidates, _, _ = self._fetch_candidates_batch(all_dispositions, "APPLY_DATE", "ASCENDING")
             new_count = 0
             for c in candidates:
                 if c['legacy_id'] not in all_candidates:
@@ -885,7 +1937,7 @@ class IndeedDownloader:
             # Pass 3: Sort by name ASC (if still missing)
             if len(all_candidates) < total_expected:
                 print("   Pass 3: By name (A -> Z)...")
-                candidates, _ = self._fetch_candidates_batch(all_dispositions, "NAME", "ASCENDING")
+                candidates, _, _ = self._fetch_candidates_batch(all_dispositions, "NAME", "ASCENDING")
                 new_count = 0
                 for c in candidates:
                     if c['legacy_id'] not in all_candidates:
@@ -896,7 +1948,7 @@ class IndeedDownloader:
             # Pass 4: Sort by name DESC (if still missing)
             if len(all_candidates) < total_expected:
                 print("   Pass 4: By name (Z -> A)...")
-                candidates, _ = self._fetch_candidates_batch(all_dispositions, "NAME", "DESCENDING")
+                candidates, _, _ = self._fetch_candidates_batch(all_dispositions, "NAME", "DESCENDING")
                 new_count = 0
                 for c in candidates:
                     if c['legacy_id'] not in all_candidates:
@@ -910,7 +1962,7 @@ class IndeedDownloader:
                 for disp in all_dispositions:
                     for sort_by in ["APPLY_DATE", "NAME"]:
                         for sort_order in ["ASCENDING", "DESCENDING"]:
-                            candidates, _ = self._fetch_candidates_batch([disp], sort_by, sort_order)
+                            candidates, _, _ = self._fetch_candidates_batch([disp], sort_by, sort_order)
                             new_count = 0
                             for c in candidates:
                                 if c['legacy_id'] not in all_candidates:
@@ -924,6 +1976,19 @@ class IndeedDownloader:
 
         print(f"\n   Total expected: {total_expected} | Fetched: {len(all_candidates_list)}")
 
+        if manifest_mod.should_abort_empty_api(self.current_manifest, len(all_candidates_list)):
+            on_disk = len(self.current_manifest['candidates'])
+            print(f"   API returned 0 candidates but {on_disk} are already on disk.")
+            print(f"   Leaving this job untouched — usually an expired session or a rate limit.")
+            print(f"   Log in again in the Chrome window and re-run this job.")
+            self.stats['archived'] += 1
+            if self.log:
+                self.log.event('empty_api_guard_tripped', {
+                    'job_folder': str(self.current_job_folder),
+                    'manifest_entries': on_disk,
+                })
+            return
+
         if len(all_candidates_list) == 0 and total_expected > 0:
             print(f"   No candidates fetched - job too old or data archived")
             self.stats['archived'] += 1
@@ -934,48 +1999,34 @@ class IndeedDownloader:
             pct = (len(all_candidates_list) / total_expected) * 100
             print(f"   Note: {missing} candidates not fetched ({pct:.1f}% fetched)")
 
-        # Load already processed names (PDFs + no_cv.txt)
-        processed_names = set()
-        if self.current_job_folder and self.current_job_folder.exists():
-            # Scan PDF files
-            for pdf_file in self.current_job_folder.rglob('*.pdf'):
-                # Format: "Jean Dupont_20251126_154317.pdf"
-                name_part = pdf_file.stem.rsplit('_', 2)[0]  # Get "Jean Dupont"
-                if name_part:
-                    clean_name = "".join(ch for ch in name_part if ch.isalnum() or ch in (' ', '-', '_')).strip().lower()
-                    processed_names.add(clean_name)
+        # Diff against the manifest. The previous implementation scanned PDF
+        # filenames with rsplit('_', 2), a shape this code stopped producing
+        # when downloads moved to <candidate>/resume.pdf — every file
+        # resolved to the string "resume", so already_processed was always 0
+        # and nothing was ever recognised as already downloaded.
+        today = time.strftime('%Y-%m-%d')
+        promoted = manifest_mod.promote_backfilled(self.current_manifest, all_candidates_list)
+        if promoted:
+            print(f"   Matched {promoted} existing candidates to Indeed ids")
 
-            # Load no_cv.txt (candidates without CV)
-            no_cv_file = self.current_job_folder / 'no_cv.txt'
-            if no_cv_file.exists():
-                with open(no_cv_file, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        name = line.strip()
-                        if name:
-                            clean_name = "".join(ch for ch in name if ch.isalnum() or ch in (' ', '-', '_')).strip().lower()
-                            processed_names.add(clean_name)
+        to_fetch = manifest_mod.diff(self.current_manifest, all_candidates_list)
+        already_processed = len(all_candidates_list) - len(to_fetch)
 
-        # Separate candidates with CV and without CV
-        candidates_with_cv = []
-        candidates_no_cv = []
-        already_processed = 0
-        for c in all_candidates_list:
-            clean_name = "".join(ch for ch in c['name'] if ch.isalnum() or ch in (' ', '-', '_')).strip().lower()
-            if clean_name in processed_names:
-                already_processed += 1
-                continue  # Already processed
-            if c['download_url']:
-                candidates_with_cv.append(c)
-            else:
-                candidates_no_cv.append(c)
+        # The global-checkpoint early return in download_cv_api used to do
+        # this; Task 6 removed it, and without this line a backend run
+        # reports "Skipped: 0" while the per-job report shows the real count.
+        self.stats['skipped'] += already_processed
 
-        # Save candidates without CV to no_cv.txt
-        if candidates_no_cv and self.current_job_folder:
-            no_cv_file = self.current_job_folder / 'no_cv.txt'
-            with open(no_cv_file, 'a', encoding='utf-8') as f:
-                for c in candidates_no_cv:
-                    f.write(c['name'] + '\n')
-            print(f"   {len(candidates_no_cv)} candidates without CV (saved to no_cv.txt)")
+        candidates_with_cv = [c for c in to_fetch if c['download_url']]
+        candidates_no_cv = [c for c in to_fetch if not c['download_url']]
+
+        for c in candidates_no_cv:
+            manifest_mod.record(
+                self.current_manifest, manifest_mod.entry_key(c),
+                c['name'], None, False, today,
+            )
+        if candidates_no_cv:
+            print(f"   {len(candidates_no_cv)} new candidates without a CV")
 
         print(f"\n   To download: {len(candidates_with_cv)} | Already done: {already_processed} | Without CV: {len(candidates_no_cv)}")
 
@@ -984,8 +2035,11 @@ class IndeedDownloader:
 
         if not candidates_with_cv:
             print("   All CVs are already downloaded!")
-            # Save stats: announced, recovered, processed
-            self._save_job_stats(total_expected, total_recovered, already_processed + len(candidates_no_cv))
+            self._finalize_job_manifest(total_expected, total_recovered,
+                                        all_candidates_list, 0)
+            # Global counter parity with the Frontend path so the end-of-run
+            # summary reflects work actually seen by this job.
+            self.stats['total_processed'] += already_processed + len(candidates_no_cv)
             # Track job stats for report
             self.job_stats.append({
                 'job_name': self.current_job_name,
@@ -995,20 +2049,31 @@ class IndeedDownloader:
                 'total_announced': total_expected,
                 'total_recovered': total_recovered
             })
+            # Still run the app-data pass — `downloaded_application_data`
+            # is dedup'd independently of the CV list, so HR can backfill
+            # screener Q&A for candidates whose resumes were already on disk.
+            self._run_app_data_pass_backend(all_candidates_list)
             return
 
         print(f"\n   Downloading...\n")
+
+        # Candidates we're skipping (CV already on disk + people who applied
+        # without a CV) count as "processed" in the global summary too.
+        self.stats['total_processed'] += already_processed + len(candidates_no_cv)
 
         downloaded_count = 0
         with tqdm(total=len(candidates_with_cv), desc="   CVs") as pbar:
             for candidate in candidates_with_cv:
                 if self.download_cv_api(candidate):
                     downloaded_count += 1
+                # Global counter parity with the Frontend path; without this
+                # the end-of-run STATISTICS block printed "Total processed: 0"
+                # even when Downloaded was e.g. 329.
+                self.stats['total_processed'] += 1
                 pbar.update(1)
 
-        # Save stats: announced, recovered, processed
-        total_processed = already_processed + len(candidates_no_cv) + downloaded_count
-        self._save_job_stats(total_expected, total_recovered, total_processed)
+        self._finalize_job_manifest(total_expected, total_recovered,
+                                    all_candidates_list, downloaded_count)
 
         # Track job stats for report
         self.job_stats.append({
@@ -1019,6 +2084,533 @@ class IndeedDownloader:
             'total_announced': total_expected,
             'total_recovered': total_recovered
         })
+
+        # Second pass: app-data per candidate, driving the UI (see
+        # _run_app_data_pass_backend). No-op when download_app_data is False.
+        # Pass the full candidate list so the pass can navigate directly to
+        # each profile by legacy_id — independent of the candidate-list
+        # sidebar DOM, which Indeed periodically restructures.
+        self._run_app_data_pass_backend(all_candidates_list)
+
+    # ==================== APP DATA (BACKEND HYBRID) ====================
+    #
+    # Pure-API app-data download would require knowing the endpoints Indeed
+    # hits when the user clicks "Download files" in the application-data
+    # modal. FindRCPMatches doesn't return them, and we don't yet have a
+    # captured example (HR_DEBUG_TOMORROW.md Snippet 3 is the planned path
+    # to capture one). Until that capture lands, we get Backend-mode parity
+    # by reusing the Frontend UI-click flow per candidate:
+    #
+    #   1. Click into the first candidate in the list sidebar.
+    #   2. Call _download_application_data_frontend() — same helper Frontend
+    #      mode already uses — to pop the kebab menu, open the modal, tick
+    #      HTML + JSON, click Download files, move files into per-candidate
+    #      folder.
+    #   3. Advance via _go_to_next_candidate() and repeat.
+    #
+    # Every candidate gets app-data; dedup via the existing
+    # checkpoint_data['downloaded_application_data'] list so reruns don't
+    # re-click. _maybe_capture_app_data_urls() records whatever the browser
+    # actually hit during the first candidate so a future build can upgrade
+    # this to pure-API.
+
+    # Fallback chain for locating the candidate-list sidebar. Tried in order
+    # until one reports ≥1 item. The previous single-selector impl failed on
+    # HR's machine (see logs/run_20260420_143601.log: abort "Could not click
+    # the first candidate") because the list DOM wasn't hydrated when a
+    # fixed 3-second sleep elapsed. A polling wait across multiple selectors
+    # absorbs both timing and DOM-variation differences.
+    _CANDIDATE_LIST_SELECTORS = (
+        '#hanselCandidateListContainer li[data-testid="CandidateListItem"]',
+        '[data-testid="candidate-list"] li[data-testid="CandidateListItem"]',
+        '[data-testid="candidates-pipeline"] li[data-testid="CandidateListItem"]',
+        'ul[role="list"] li[data-testid="CandidateListItem"]',
+        'li[data-testid="CandidateListItem"]',
+    )
+
+    def _click_first_candidate_in_list(self) -> bool:
+        """Click the first row in the candidate-list sidebar so subsequent
+        _go_to_next_candidate() calls have a current row to advance from.
+
+        Polls multiple candidate-list selectors for up to 8s — enough to
+        survive the list-hydration race on slower machines / first-render
+        after navigation."""
+        deadline = time.time() + 8.0
+        while time.time() < deadline:
+            for sel in self._CANDIDATE_LIST_SELECTORS:
+                try:
+                    count = self.driver.execute_script(
+                        "return document.querySelectorAll(arguments[0]).length;",
+                        sel,
+                    )
+                except Exception:
+                    continue
+                if not count:
+                    continue
+                try:
+                    clicked = self.driver.execute_script(
+                        """
+                        const items = document.querySelectorAll(arguments[0]);
+                        if (!items.length) return false;
+                        const btn = items[0].querySelector('button[data-testid="CandidateListItem-button"]')
+                                    || items[0].querySelector('button')
+                                    || items[0].querySelector('a');
+                        if (!btn) return false;
+                        items[0].scrollIntoView({block: 'center'});
+                        btn.click();
+                        return true;
+                        """,
+                        sel,
+                    )
+                except Exception:
+                    continue
+                if clicked:
+                    return True
+            time.sleep(0.5)
+        return False
+
+    def _log_app_data_pass_abort(self, reason: str) -> None:
+        """Best-effort diagnostic dump when the app-data pass can't start.
+        Writes a structured event to the run log with URL, page title, and
+        DOM counts so the next regression triages from latest.log alone."""
+        if not self.log:
+            return
+        try:
+            title = self.driver.title
+        except Exception:
+            title = '<title unavailable>'
+        try:
+            url = self.driver.current_url
+        except Exception:
+            url = '<url unavailable>'
+        try:
+            counts = self.driver.execute_script(
+                """
+                return {
+                    hansel: document.querySelectorAll('#hanselCandidateListContainer li').length,
+                    testid: document.querySelectorAll('li[data-testid="CandidateListItem"]').length,
+                    any_li: document.querySelectorAll('ul li').length,
+                    aria_current: document.querySelectorAll('[aria-current="true"]').length,
+                };
+                """
+            )
+        except Exception:
+            counts = None
+        self.log.event('app_data_pass_abort', {
+            'reason': reason,
+            'url': url,
+            'page_title': title,
+            'list_counts': counts,
+            'download_app_data': self.download_app_data,
+        })
+
+    def _maybe_capture_app_data_urls(self) -> None:
+        """Best-effort: scrape Chrome's performance log for XHR URLs that
+        match known app-data patterns and append them to
+        logs/app_data_urls.json. Used to bootstrap a Stage-2 pure-API
+        upgrade without requiring HR to paste DevTools output.
+
+        Query strings are stripped before anything is written. They carried
+        live `indeedcsrftoken` values — 60 of them in one real artifact — plus
+        candidate ids. The upgrade this file exists to inform needs the shape
+        of the endpoint (host, path, method, whether there was a body); it
+        never needed the secrets.
+
+        The pattern is anchored to the path for the same reason it is stripped:
+        matching the whole URL meant any Indeed URL with "application" anywhere
+        in its query landed here, which is how 38 telemetry requests carrying
+        `&application=globalnav` got captured along with their parameters."""
+        try:
+            logs = self.driver.get_log('performance')
+        except Exception:
+            return
+
+        found = []
+        for log in logs:
+            try:
+                msg = json.loads(log['message'])['message']
+                method = msg.get('method', '')
+                if method not in ('Network.requestWillBeSent', 'Network.responseReceived'):
+                    continue
+                params = msg.get('params', {}) or {}
+                url = (params.get('request') or params.get('response') or {}).get('url', '')
+                if not url:
+                    continue
+                parsed = urlparse(url)
+                if not re.search(r'iq/job/answers|cao_post_body|original-application|application',
+                                 parsed.path, re.I):
+                    continue
+                if 'graphql' in parsed.path:
+                    continue
+                # The JS bundles are served from a path containing
+                # "original-application" and carry nothing about an applicant.
+                if re.search(r'\.(js|css|map|woff2?|png|svg|jpe?g|ico)$', parsed.path, re.I):
+                    continue
+                safe_url = parsed._replace(query='', fragment='').geturl()
+                entry = {
+                    'direction': 'request' if method == 'Network.requestWillBeSent' else 'response',
+                    'url': safe_url,
+                    'query_param_names': sorted(parse_qs(parsed.query).keys()),
+                }
+                if method == 'Network.requestWillBeSent':
+                    req = params.get('request') or {}
+                    entry['http_method'] = req.get('method')
+                    entry['has_body'] = bool(req.get('postData'))
+                found.append(entry)
+            except (KeyError, json.JSONDecodeError):
+                continue
+
+        if not found:
+            return
+
+        try:
+            out_file = Path(self.log_folder) / 'app_data_urls.json'
+            existing = []
+            if out_file.exists():
+                try:
+                    with open(out_file, 'r', encoding='utf-8') as f:
+                        existing = json.load(f) or []
+                except (json.JSONDecodeError, IOError):
+                    existing = []
+            seen = {(e.get('direction'), e.get('url')) for e in existing if isinstance(e, dict)}
+            for entry in found:
+                key = (entry.get('direction'), entry.get('url'))
+                if key not in seen:
+                    existing.append(entry)
+                    seen.add(key)
+            with open(out_file, 'w', encoding='utf-8') as f:
+                json.dump(existing, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _snapshot_download_locations(self, candidate_name: str, candidate_folder: Path) -> None:
+        """Diagnostic dump of every place Chrome might have dropped the
+        app-data files. Called once on the first 'files' failure so we can
+        tell whether files are landing somewhere unexpected (theory: CDP
+        Page.setDownloadBehavior is being ignored for this download flow
+        in attach mode and Chrome is using the user's profile-default
+        Downloads folder instead).
+
+        Captures three locations and a Chrome-side download-history list:
+          1. The current job folder (where _move_application_files looks)
+          2. The global downloads/ root (CDP attach-init fallback)
+          3. The user's profile Downloads (~/Downloads on Windows)
+          4. chrome://downloads via CDP (what Chrome thinks it just saved)
+        """
+        if not self.log:
+            return
+
+        snapshot = {'candidate': candidate_name, 'locations': {}}
+
+        # Filesystem snapshots — match the same patterns _move_application_files
+        # globs for, so we can tell whether files exist anywhere.
+        patterns_html = ['*-original-application.HTML', '*-original-application.html', '*.HTML']
+        patterns_json = ['cao_post_body_*.json', 'cao_post_body*.json']
+
+        candidates_to_check = [
+            ('job_folder', self.current_job_folder),
+            ('global_downloads', Path(self.download_folder).absolute()),
+            ('candidate_folder', candidate_folder),
+        ]
+        # User profile Downloads: works on Windows, macOS, Linux.
+        try:
+            user_downloads = Path.home() / 'Downloads'
+            candidates_to_check.append(('user_home_downloads', user_downloads))
+        except Exception:
+            pass
+
+        for label, folder in candidates_to_check:
+            if not folder:
+                continue
+            try:
+                if not Path(folder).exists():
+                    snapshot['locations'][label] = {'path': str(folder), 'exists': False}
+                    continue
+                hits_html = []
+                hits_json = []
+                for pat in patterns_html:
+                    hits_html.extend(str(f.name) for f in Path(folder).glob(pat))
+                for pat in patterns_json:
+                    hits_json.extend(str(f.name) for f in Path(folder).glob(pat))
+                # Also list any file modified in the last 5 minutes — catches
+                # filenames Indeed may have changed (e.g., we still glob for
+                # 'cao_post_body' but Indeed renamed it).
+                recent = []
+                cutoff = time.time() - 300
+                try:
+                    for f in Path(folder).iterdir():
+                        if f.is_file() and f.stat().st_mtime >= cutoff:
+                            recent.append(f.name)
+                except (OSError, PermissionError):
+                    pass
+                snapshot['locations'][label] = {
+                    'path': str(folder),
+                    'exists': True,
+                    'matched_html': hits_html[:20],
+                    'matched_json': hits_json[:20],
+                    'recent_files_5min': recent[:30],
+                }
+            except Exception as e:
+                snapshot['locations'][label] = {'path': str(folder), 'error': repr(e)}
+
+        # Chrome's own download history — sometimes a download started but
+        # Chrome blocked it (e.g., as a duplicate or for a different MIME
+        # type) and the file never actually wrote. Scrape chrome://downloads
+        # via the document API to see Chrome's view.
+        try:
+            chrome_downloads = self.driver.execute_script("""
+                // Save current URL so we can return.
+                const ret = {tried: false, items: [], err: null};
+                ret.tried = true;
+                return ret;
+            """)
+            snapshot['chrome_downloads_note'] = (
+                'chrome://downloads requires a navigation; skipped to avoid'
+                ' interrupting the candidate flow. Browser history can be'
+                ' inspected manually if filesystem snapshots are empty.'
+            )
+        except Exception as e:
+            snapshot['chrome_downloads_error'] = repr(e)
+
+        self.log.event('app_data_download_locations_snapshot', snapshot)
+
+    def _run_app_data_pass_backend(self, candidates_list: Optional[list] = None) -> None:
+        """Run the UI-driven app-data download flow over every candidate
+        for the currently active job, driven by direct URL navigation
+        rather than candidate-list sidebar pagination.
+
+        Why not use the list sidebar? Indeed quietly shipped a new candidate
+        list DOM (see logs/run_20260420_155009.log: "any_li":225 on page but
+        "testid":0 and "hansel":0). Every list selector we had assumed the
+        container was `#hanselCandidateListContainer` with
+        `data-testid="CandidateListItem"` rows — those attributes are gone
+        on the new UI variant, so every list-sidebar-based approach fails
+        regardless of how many fallback selectors we stack.
+
+        Direct URL navigation bypasses the list entirely: we already have
+        every candidate's `legacy_id` from the GraphQL response, and
+        Indeed's profile URL takes that id as a query param
+        (`?id=<legacy_id>&selectedJobs=<iri>`). On each iteration we
+        navigate there, wait for the "..." kebab to appear, and then run
+        the existing `_download_application_data_frontend` helper which
+        uses text- and aria-label-based selectors that survive DOM renames.
+        """
+        if not self.download_app_data:
+            return
+        if not self.current_job_folder:
+            print("   ⚠ Skipping app-data pass: no job folder set.")
+            return
+        if not candidates_list:
+            print("   ⚠ Skipping app-data pass: no candidate list provided.")
+            if self.log:
+                self.log.event('app_data_pass_abort', {'reason': 'no_candidates_list'})
+            return
+
+        # Per-candidate profile URLs target the DETAIL view at /candidates/view
+        # (NOT the list view at /candidates). On the detail view, `id=` is the
+        # candidate's legacy id and `legacyJobId=` is the JOB short id; on the
+        # list view, `id=` is the JOB short id and we'd be putting the candidate
+        # id in the wrong slot — landing on a misconfigured list page where the
+        # "Download application data" menu item doesn't exist. That was the
+        # 0/331 failure in logs/run_20260422_203651.log.
+        job_legacy_encoded = quote(self.current_job_legacy_id, safe='') if self.current_job_legacy_id else ''
+
+        # Count shared display names before claiming any file — see
+        # _note_roster_slugs. Two applicants with the same name produce the
+        # same download filename, and neither file can then be attributed.
+        self._note_roster_slugs(candidates_list)
+        ambiguous = sorted(s for s, n in self.current_roster_slugs.items() if n > 1)
+        if ambiguous:
+            print(f"   ⚠ {len(ambiguous)} display name(s) are shared by more than one "
+                  f"applicant. Their application files cannot be told apart, so they "
+                  f"are left in the job folder rather than filed under a guess.")
+
+        print(f"\n📎 App-data pass — visiting each of {len(candidates_list)} candidate profiles directly...")
+
+        discovered = False
+        processed = 0
+        succeeded = 0
+        failed = 0
+        skipped_already_done = 0
+        first_failure_logged = False
+        download_snapshot_logged = False
+        consecutive_failures = 0
+        # Pull the plug after this many in-a-row helper failures. At 5×20s=100s
+        # we've spent enough to prove it's systemic (DOM change), not flaky.
+        # Saves HR hours of silent grinding like logs/run_20260422_203651.log
+        # (331 candidates × 20s each = 1h48m of 100% failure before we noticed).
+        EARLY_ABORT_THRESHOLD = 5
+
+        pbar = tqdm(total=len(candidates_list), desc="   App data")
+        try:
+            for candidate in candidates_list:
+                name = candidate.get('name') or 'Unknown'
+                legacy_id = candidate.get('legacy_id')
+
+                if not legacy_id:
+                    # Should be rare — the GraphQL extractor normally drops
+                    # candidates without a legacyID. If one slips through,
+                    # we can't navigate to their profile by URL.
+                    failed += 1
+                    if self.log and not first_failure_logged:
+                        self.log.event('app_data_pass_abort',
+                                       {'reason': 'no_legacy_id', 'name_hash': hash(name)})
+                        first_failure_logged = True
+                    pbar.update(1)
+                    continue
+
+                if name in self.checkpoint_data.get('downloaded_application_data', []):
+                    skipped_already_done += 1
+                    pbar.update(1)
+                    continue
+
+                # Pass the API dict, not just the name. The guard above already
+                # proved this candidate has a legacy_id, so entry_key returns
+                # the real Indeed ID and allocate_candidate_folder hands back
+                # the exact folder the CV pass recorded for it. Resolving by
+                # name instead breaks on duplicates: find_key_by_name refuses
+                # an ambiguous name, so two Maria Garcias both fall back to one
+                # _nokey: key and — nothing calls record() in this pass — get
+                # the SAME new folder, putting both applicants' screener Q&A in
+                # a phantom third directory away from either resume.
+                candidate_folder = self._candidate_folder_for(name, candidate)
+
+                # Navigate to this candidate's profile-DETAIL view. `legacyJobId`
+                # carries the job context so the profile's kebab menu includes
+                # "Download application data" instead of just the generic row
+                # actions. Fall back to id-only if we didn't capture a job
+                # legacy id (unusual but possible if Indeed's URL shape changes);
+                # page may still resolve via session state.
+                candidate_id_encoded = quote(legacy_id, safe='')
+                if job_legacy_encoded:
+                    profile_url = (
+                        f"https://employers.indeed.com/candidates/view"
+                        f"?id={candidate_id_encoded}&legacyJobId={job_legacy_encoded}"
+                    )
+                else:
+                    profile_url = f"https://employers.indeed.com/candidates/view?id={candidate_id_encoded}"
+
+                try:
+                    self.driver.get(profile_url)
+                except Exception:
+                    failed += 1
+                    pbar.update(1)
+                    continue
+
+                # Wait for the profile to render — the "..." kebab being
+                # present is our proof of life. _find_element_by_selectors
+                # uses WebDriverWait so this returns as soon as the kebab
+                # exists (or after the timeout).
+                kebab = self._find_element_by_selectors(self._KEBAB_MENU_SELECTORS, timeout_per=2.0)
+                if not kebab:
+                    failed += 1
+                    if self.log and not first_failure_logged:
+                        self._log_app_data_pass_abort('kebab_not_found_after_nav')
+                        first_failure_logged = True
+                    pbar.update(1)
+                    continue
+
+                helper_ok = self._download_application_data_frontend(
+                    name, candidate_folder, legacy_id=candidate.get('legacy_id'))
+
+                # Capture endpoint URLs for EVERY candidate attempt (success
+                # or failure), not just first-success. The previous "wait
+                # for first success" gate meant logs/run_20260429_143537.log
+                # produced 0 successes and 0 captured URLs — so we never
+                # learned where Indeed was actually firing requests. With
+                # this on every iteration, we get telemetry the moment any
+                # network call matches, even if downstream file-save fails.
+                self._maybe_capture_app_data_urls()
+
+                if helper_ok:
+                    self._save_checkpoint(name=name, app_data=True)
+                    self.stats['app_data_downloaded'] += 1
+                    succeeded += 1
+                    consecutive_failures = 0
+                    discovered = True
+                else:
+                    failed += 1
+                    consecutive_failures += 1
+                    step = getattr(self, '_last_helper_failure_step', None) or 'unknown'
+
+                    # On the FIRST 'files' failure, snapshot every plausible
+                    # download location so we can tell where Chrome is
+                    # actually dropping the .html / .json files (if at all).
+                    # Three theories: job folder (expected), global downloads/
+                    # (CDP fallback), or user's profile Downloads (CDP ignored).
+                    # Tracked separately from first_failure_logged because an
+                    # earlier non-'files' failure (e.g. 'checkbox_html' on a
+                    # candidate without a screener questionnaire) shouldn't
+                    # consume the snapshot slot.
+                    if step == 'files' and not download_snapshot_logged:
+                        self._snapshot_download_locations(name, candidate_folder)
+                        download_snapshot_logged = True
+                    if self.log:
+                        # Lightweight per-candidate event so we can tell HR
+                        # exactly which DOM lookup died, for every candidate
+                        # that failed — not just the first.
+                        self.log.event('app_data_helper_step_fail', {
+                            'step': step,
+                            'candidate': name,
+                        })
+                    if self.log and not first_failure_logged:
+                        self._log_app_data_pass_abort(f'helper_returned_false:{step}')
+                        first_failure_logged = True
+
+                    if consecutive_failures >= EARLY_ABORT_THRESHOLD:
+                        # Likely a DOM change; stop flogging a dead horse.
+                        print(f"\n   ⚠ App-data pass: aborting after {consecutive_failures} "
+                              f"consecutive failures on step '{step}'.")
+                        print( "     Indeed probably renamed that element. Per-candidate "
+                               "'app_data_helper_step_fail' events are in logs/latest.log —")
+                        print( "     share with Pawel and the selector list can be patched.")
+                        if self.log:
+                            self.log.event('app_data_pass_early_abort', {
+                                'consecutive_failures': consecutive_failures,
+                                'last_step': step,
+                                'processed': processed + 1,
+                                'remaining': len(candidates_list) - (processed + 1),
+                            })
+                        processed += 1
+                        pbar.update(1)
+                        break
+
+                processed += 1
+                pbar.update(1)
+                time.sleep(self.next_candidate_delay)
+        finally:
+            pbar.close()
+
+            # Late-claim sweep: pick up any HTML files that landed in the
+            # job folder after _move_application_files gave up but before
+            # the loop exited (OneDrive lag, late Chrome finalize, etc).
+            # Matches by candidate-name slug so we don't grab someone
+            # else's file. Each rescued file bumps the success count.
+            late_claimed = self._late_claim_application_html(candidates_list)
+            if late_claimed > 0:
+                succeeded += late_claimed
+                failed = max(0, failed - late_claimed)
+                if self.log:
+                    self.log.event('app_data_late_claim_summary', {'count': late_claimed})
+
+            if self.log:
+                self.log.event('app_data_pass_summary', {
+                    'processed': processed,
+                    'succeeded': succeeded,
+                    'failed': failed,
+                    'skipped_already_done': skipped_already_done,
+                    'late_claimed': late_claimed,
+                })
+            # Console-visible outcome so HR knows if something went wrong
+            # without having to read the log file.
+            if failed > 0:
+                msg = f"   ⚠ App-data pass: {succeeded} saved, {failed} failed, {skipped_already_done} already on disk."
+                if late_claimed > 0:
+                    msg += f" (+{late_claimed} rescued via late-claim)"
+                print(msg)
+                print("     (Details written to logs/latest.log — first failure's DOM state was captured.)")
+            else:
+                print(f"   ✅ App-data pass: {succeeded} saved ({skipped_already_done} already on disk).")
 
     # ==================== FRONTEND MODE (Selenium) ====================
 
@@ -1037,10 +2629,44 @@ class IndeedDownloader:
                            document.querySelector('h1');
                 return el ? el.textContent.trim() : 'Job';
             """)
-            self._create_job_folder(job_name)
+            # Frontend mode lands the user on a candidate page rather than the
+            # jobs table, so the URL shape is not guaranteed to carry either
+            # identifier. Harvest whatever is present and pass it through:
+            # with an id the manifest collapses this folder onto the same one
+            # the backend and all-jobs paths use; without one it still works,
+            # falling back to name-and-date resolution.
+            job_url = self.driver.current_url
+            employer_job_id = self._extract_job_id_from_url(job_url)
+            short_id = None
+            try:
+                params = parse_qs(urlparse(job_url).query)
+                candidate_short = params.get('legacyJobId', [None])[0]
+                # `id` on a /candidates/view URL is the CANDIDATE's id, not the
+                # job's. Writing it into job.short_id would make this folder
+                # falsely match a different job later, so only trust `id` when
+                # we are not on a profile view.
+                if not candidate_short and '/candidates/view' not in urlparse(job_url).path:
+                    candidate_short = params.get('id', [None])[0]
+                if candidate_short and candidate_short != '0':
+                    short_id = candidate_short
+            except (ValueError, KeyError, IndexError):
+                pass
+            self._create_job_folder(
+                job_name, None,
+                employer_job_id=employer_job_id,
+                short_id=short_id,
+            )
             print(f"📁 Folder: {self.current_job_folder}")
-        except Exception:
-            pass
+            if self.log:
+                self.log.event('frontend_single_job_ids', {
+                    'has_employer_job_id': bool(employer_job_id),
+                    'has_short_id': bool(short_id),
+                })
+        except Exception as e:
+            print(f"❌ Could not prepare the job folder: {e!r}")
+            if self.log:
+                self.log.event('frontend_single_job_folder_failed', {'err': repr(e)})
+            return
 
         self._download_all_candidates_frontend()
 
@@ -1064,7 +2690,7 @@ class IndeedDownloader:
 
             # Always compute the candidate folder — CV flow and app-data flow
             # both need it, and mkdir is idempotent.
-            candidate_folder = self._create_candidate_folder(name)
+            candidate_folder = self._candidate_folder_for(name)
 
             # Check if already downloaded (CV dedup)
             if name in self.checkpoint_data['downloaded_names']:
@@ -1182,21 +2808,6 @@ class IndeedDownloader:
         "//div[@role='dialog']//button[@type='submit']",
     ]
 
-    def _create_candidate_folder(self, name: str) -> Path:
-        """Return (and create) downloads/<job>/<safe candidate name>/.
-
-        Sanitization matches the other places that clean a candidate name:
-        keep alphanumerics, spaces, dashes, underscores; strip everything else.
-        Falls back to 'unknown' if the cleaned name ends up empty.
-        """
-        safe_name = "".join(c for c in name if c.isalnum() or c in (' ', '-', '_')).strip()
-        if not safe_name:
-            safe_name = "unknown"
-        base = self.current_job_folder or Path(self.download_folder)
-        folder = base / safe_name
-        folder.mkdir(parents=True, exist_ok=True)
-        return folder
-
     def _download_cv_frontend(self, name: str, candidate_folder: Path) -> bool:
         """Download CV using click, then move the PDF into candidate_folder."""
         try:
@@ -1282,11 +2893,31 @@ class IndeedDownloader:
         except Exception:
             return False
 
-    def _download_application_data_frontend(self, name: str, candidate_folder: Path) -> bool:
-        """Automate the "..." -> Download application data -> check boxes -> Download files flow."""
+    def _download_application_data_frontend(self, name: str, candidate_folder: Path,
+                                            legacy_id: Optional[str] = None) -> bool:
+        """Automate the "..." -> Download application data -> check boxes -> Download files flow.
+
+        legacy_id identifies WHICH applicant this is, and is passed straight
+        through to the JSON fetch. Without it that fetch fell back to reading
+        the id off the browser URL, which is not guaranteed to be the
+        applicant whose folder was passed in.
+
+        On failure, sets `self._last_helper_failure_step` to one of:
+          'kebab_in_helper' — outer wait saw kebab but re-lookup in helper failed (stale/race)
+          'menu_item'       — clicked kebab, "Download application data" menuitem text not found
+          'modal'           — clicked menuitem, modal/dialog with that heading not found
+          'checkbox_html'   — modal open, no row matching `-original-application(.html)?`
+          'checkbox_json'   — modal open, no row matching `cao_post_body`
+          'confirm'         — checkboxes ticked, "Download files" submit button not found
+          'files'           — confirm clicked, expected files never landed in job folder
+          'exception'       — something threw; see stderr for traceback
+        Outer caller reads this for logging and early-abort.
+        """
+        self._last_helper_failure_step = None
         try:
             kebab = self._find_element_by_selectors(self._KEBAB_MENU_SELECTORS, timeout_per=1.5)
             if not kebab:
+                self._last_helper_failure_step = 'kebab_in_helper'
                 return False
             self.driver.execute_script(
                 "arguments[0].scrollIntoView({block: 'center'}); arguments[0].click();", kebab
@@ -1295,6 +2926,7 @@ class IndeedDownloader:
 
             item = self._find_element_by_selectors(self._APP_DATA_MENU_ITEM_SELECTORS, timeout_per=1.5)
             if not item:
+                self._last_helper_failure_step = 'menu_item'
                 try:
                     self.driver.execute_script("document.body.click();")
                 except Exception:
@@ -1305,16 +2937,24 @@ class IndeedDownloader:
 
             modal = self._find_element_by_selectors(self._APP_DATA_MODAL_SELECTORS, timeout_per=3)
             if not modal:
+                self._last_helper_failure_step = 'modal'
                 try:
                     self.driver.execute_script("document.body.click();")
                 except Exception:
                     pass
                 return False
 
-            # Tick HTML + JSON; skip PDF (already downloaded as the resume).
-            html_ok = self._check_app_data_box(r'-original-application\.html|original-application', modal)
-            json_ok = self._check_app_data_box(r'cao_post_body', modal)
-            if not (html_ok and json_ok):
+            # Tick the HTML row only. The JSON checkbox in Indeed's modal
+            # is broken/cosmetic as of 2026-04-29 — ticking it does NOT
+            # trigger a Chrome download (verified via
+            # app_data_download_locations_snapshot in
+            # logs/run_20260429_145657.log: HTML file lands but no
+            # `cao_post_body_*.json` exists anywhere on disk). The same
+            # data is still served by Indeed's iq/job/answers API which we
+            # call directly after HTML lands. Skip PDF (= the resume,
+            # already downloaded by the CV pass).
+            if not self._check_app_data_box(r'-original-application\.html|original-application', modal):
+                self._last_helper_failure_step = 'checkbox_html'
                 try:
                     self.driver.execute_script("document.body.click();")
                 except Exception:
@@ -1323,6 +2963,7 @@ class IndeedDownloader:
 
             confirm = self._find_element_by_selectors(self._APP_DATA_CONFIRM_SELECTORS, timeout_per=1.5)
             if not confirm:
+                self._last_helper_failure_step = 'confirm'
                 try:
                     self.driver.execute_script("document.body.click();")
                 except Exception:
@@ -1330,53 +2971,185 @@ class IndeedDownloader:
                 return False
             self.driver.execute_script("arguments[0].click();", confirm)
 
-            return self._move_application_files(name, candidate_folder)
+            if not self._move_application_files(name, candidate_folder):
+                self._last_helper_failure_step = 'files'
+                return False
+
+            # HTML landed. Now fetch the screener Q&A JSON via Indeed's
+            # iq/job/answers endpoint — discovered from passive URL capture
+            # (logs/app_data_urls.json). This runs in the page context so
+            # the existing session cookies and CSRF token are reused
+            # automatically. Best-effort: failure is logged but doesn't
+            # block overall success since the HTML file already contains
+            # the same Q&A data in human-readable form.
+            self._fetch_application_json_via_page(candidate_folder, legacy_id=legacy_id)
+            return True
 
         except Exception:
+            self._last_helper_failure_step = 'exception'
             try:
                 self.driver.execute_script("document.body.click();")
             except Exception:
                 pass
             return False
 
-    def _move_application_files(self, name: str, candidate_folder: Path) -> bool:
-        """Wait for Chrome to drop the two app-data files in the job folder,
-        then move + rename them into the candidate folder as
-        application.html and application.json. Returns True iff BOTH arrived.
+    def _note_roster_slugs(self, candidates_list: list) -> None:
+        """Record how many applicants in this job share each filename slug.
 
-        Snapshots the set of matching files already present in the job folder
-        at call time (e.g., stragglers from a previous candidate whose download
-        was still streaming) so we don't misattribute them to this candidate.
+        Indeed names the downloaded application file from the display name, so
+        two different people called "Michael Garcia" produce the same filename.
+        An exact slug match is then not proof of ownership, and the claim's
+        rename to application.html destroys the only evidence of whose it was.
+        Counting the roster up front is what lets the claim refuse.
+        """
+        counts = {}
+        for candidate in candidates_list or []:
+            slug = self._candidate_name_slug(candidate.get('name') or '')
+            if slug:
+                counts[slug] = counts.get(slug, 0) + 1
+        self.current_roster_slugs = counts
+
+    def _roster_slug_count(self, slug: str) -> int:
+        """How many applicants in this job share `slug`. 1 when unknown —
+        an unpopulated roster must not block every claim."""
+        return (getattr(self, 'current_roster_slugs', None) or {}).get(slug, 1)
+
+    @staticmethod
+    def _exact_application_html_matches(job_folder: Path, slug: str) -> list:
+        """Files in `job_folder` that provably belong to `slug`.
+
+        Exact stem match only — `<slug>-original-application` with either
+        casing of the extension. No prefix glob, no bare `*.HTML` sweep.
+        Both existed here and in the late-claim sweep, and both filed one
+        applicant's screener answers under another applicant's name:
+        "ana-ruiz" is a prefix of "ana-ruiz-martinez", and the generic
+        sweep took any stray file in the folder.
+
+        Returning nothing is the correct answer for an ambiguous file. The
+        claim renames it to application.html, which destroys the only record
+        of whose it was, so a wrong claim cannot be detected afterwards, let
+        alone undone. A file left in the job folder is visible and can be
+        placed by hand.
+
+        Verified against a real Indeed artifact: display name
+        "Bharadwaj Byroju" produced "bharadwaj-byroju-original-application.HTML"
+        — uppercase extension, no counter, no id. Both sides are lowercased so
+        the match is case-insensitive on NTFS and APFS alike.
+        """
+        if not slug:
+            return []
+        # Chrome appends " (1)", " (2)" when a file of that name is already in
+        # the folder — which is exactly the situation the late-claim sweep
+        # exists for. The slug is still exactly ours, so the counter does not
+        # weaken ownership, and refusing it stranded the file permanently.
+        wanted = re.compile(
+            rf"^{re.escape(slug)}-original-application(?: \(\d+\))?$", re.I)
+        return [
+            child for child in sorted(job_folder.glob("*"))
+            if child.is_file()
+            and child.suffix.lower() == ".html"
+            and wanted.match(child.stem)
+        ]
+
+    @staticmethod
+    def _candidate_name_slug(name: str) -> str:
+        """Convert a candidate display name into the lowercase-hyphen form
+        Indeed uses in app-data filenames (e.g., "MALLORY MARNEY" →
+        "mallory-marney"). Used to scope file globs to ONE candidate, so
+        stragglers in the job folder from prior iterations can't confuse
+        the move logic.
+        """
+        if not name:
+            return ''
+        s = unicodedata.normalize('NFKD', name)
+        s = ''.join(ch for ch in s if not unicodedata.combining(ch))
+        s = s.lower()
+        # Indeed uses hyphens between word parts and dashes for periods
+        # in name suffixes (e.g., "T.J." → "t.j.-blazer" — keep dots).
+        s = re.sub(r'[^a-z0-9.\s-]', '', s)
+        s = re.sub(r'\s+', '-', s).strip('-')
+        return s
+
+    def _move_application_files(self, name: str, candidate_folder: Path) -> bool:
+        """Wait for Chrome to drop the HTML application file in the job
+        folder, then move + rename it into the candidate folder as
+        application.html. Returns True iff the HTML arrived within ~30s.
+
+        Why we glob by candidate-name slug: previous build globbed
+        '*-original-application.HTML' and excluded files in pre_existing
+        snapshot, but on OneDrive paths (which HR uses) Chrome's download
+        + Windows file lock + OneDrive sync can race in ways that made
+        rename() fail and leave the file orphaned in the job folder
+        (logs/run_20260429_155223.log: 5 candidates' HTML files visibly
+        present in job folder, none moved into per-candidate folders).
+        Scoping to slug avoids the cross-candidate confusion entirely —
+        we only touch THIS candidate's file, no matter when it landed.
+
+        The match is EXACT, and there is no generic fallback. Both used to
+        exist and both mis-filed. `{slug}*.HTML` is a prefix match, so
+        "ana-ruiz" claimed "ana-ruiz-martinez-original-application.HTML"
+        whenever Ana Ruiz's own file had not landed yet. The bare `*.HTML`
+        sweep took whatever was lying in the job folder; its own comment
+        conceded it "could pick up someone else's file" and argued that
+        renaming to a unique application.html made that safe — which
+        protects the DESTINATION from a double write and says nothing about
+        the SOURCE being the wrong person's file.
+
+        Both failures are silent and unrecoverable: the rename destroys the
+        filename that identified the real owner, and nothing else on disk
+        records where application.html came from. A file we cannot prove
+        belongs to this applicant is left alone — an unclaimed file is
+        visible in the job folder and can be placed by hand, which a
+        mis-filed one cannot.
+
+        JSON note: the modal's "raw JSON" checkbox no longer triggers a
+        Chrome download as of 2026-04-29 (Indeed UI change). JSON is
+        fetched separately in _fetch_application_json_via_page() via
+        Indeed's iq/job/answers endpoint, after this helper returns.
         """
         job_folder = self.current_job_folder or Path(self.download_folder)
         html_target = candidate_folder / "application.html"
-        json_target = candidate_folder / "application.json"
+        slug = self._candidate_name_slug(name)
+
+        # Two cases where no file can be attributed to this applicant. Both
+        # return immediately rather than polling for 30s and then reporting
+        # 'files', which is indistinguishable from "Chrome downloaded nothing"
+        # and — five in a row — aborts the app-data pass for everyone left.
+        if not slug:
+            # _candidate_name_slug strips to ASCII, so a name written entirely
+            # in CJK, Cyrillic, Arabic, Hangul or Greek slugs to "". We cannot
+            # tell which file is theirs. The JSON fetch is id-driven and still
+            # correct, so let the caller reach it.
+            if self.log:
+                self.log.event('app_data_html_unmatchable_name',
+                               {'reason': 'slug_empty_after_ascii_fold'})
+            self._last_helper_failure_step = 'html_unmatchable_name'
+            return html_target.exists()
+
+        if self._roster_slug_count(slug) > 1:
+            # Indeed derives the filename from the display name, so two
+            # different people with the same name produce the same filename
+            # and the second gets Chrome's " (1)". Neither file is
+            # attributable. Claiming either one files a stranger's screener
+            # answers and the rename destroys the evidence.
+            if self.log:
+                self.log.event('app_data_html_ambiguous_name', {'slug': slug})
+            self._last_helper_failure_step = 'html_ambiguous_name'
+            return html_target.exists()
 
         def _find_html_matches():
-            return (
-                list(job_folder.glob("*-original-application.HTML"))
-                + list(job_folder.glob("*-original-application.html"))
-                + list(job_folder.glob("*.HTML"))
-            )
-
-        def _find_json_matches():
-            return (
-                list(job_folder.glob("cao_post_body_*.json"))
-                + list(job_folder.glob("cao_post_body*.json"))
-            )
-
-        # Snapshot pre-existing matching files to exclude them from "just arrived".
-        pre_existing_html = set(_find_html_matches())
-        pre_existing_json = set(_find_json_matches())
+            return self._exact_application_html_matches(job_folder, slug)
 
         html_found = html_target.exists()
-        json_found = json_target.exists()
 
-        for _ in range(30):  # up to ~15s
+        # Bumped 15s → 30s. HR's setup is on OneDrive
+        # (C:\Users\nikki\OneDrive\...) which adds noticeable latency to
+        # Chrome's download finalize → Windows rename → OneDrive index
+        # pipeline. Files were verifiably landing but after the old 15s
+        # cutoff (logs/run_20260429_155223.log download_locations_snapshot).
+        for _ in range(60):  # up to ~30s
             if not html_found:
                 for f in _find_html_matches():
-                    if f in pre_existing_html:
-                        continue
                     if f.is_file() and f.stat().st_size > 0:
                         try:
                             if html_target.exists():
@@ -1385,27 +3158,331 @@ class IndeedDownloader:
                             html_found = True
                             break
                         except OSError:
+                            # OneDrive may briefly lock the file during sync;
+                            # try again on the next poll instead of giving up.
                             pass
 
-            if not json_found:
-                for f in _find_json_matches():
-                    if f in pre_existing_json:
-                        continue
-                    if f.is_file() and f.stat().st_size > 0:
-                        try:
-                            if json_target.exists():
-                                json_target.unlink()
-                            f.rename(json_target)
-                            json_found = True
-                            break
-                        except OSError:
-                            pass
-
-            if html_found and json_found:
+            if html_found:
                 return True
             time.sleep(0.5)
 
-        return html_found and json_found
+        return html_found
+
+    def _discover_csrf_from_perflog(self) -> Optional[str]:
+        """Scan Chrome's performance log for any URL that includes
+        `indeedcsrftoken=<value>`. Indeed's own page fires this token in
+        URLs (the iq/job/answers GET during the modal flow is the
+        reliable one), so passive capture from the perf-log buffer is
+        sufficient. Returns the token (32+ hex chars) or None.
+
+        Cached by the caller on self._indeed_csrf_token after first
+        discovery — the token is session-scoped and stable for the run.
+        """
+        try:
+            logs = self.driver.get_log('performance')
+        except Exception:
+            return None
+
+        pattern = re.compile(r'indeedcsrftoken=([a-f0-9]{16,})', re.IGNORECASE)
+        for entry in logs:
+            try:
+                msg = json.loads(entry['message'])['message']
+                method = msg.get('method', '')
+                if method not in ('Network.requestWillBeSent', 'Network.responseReceived'):
+                    continue
+                params = msg.get('params', {}) or {}
+                url = (params.get('request') or params.get('response') or {}).get('url', '')
+                if not url:
+                    continue
+                m = pattern.search(url)
+                if m:
+                    return m.group(1)
+            except (KeyError, json.JSONDecodeError):
+                continue
+        return None
+
+    def _late_claim_application_html(self, candidates_list: list) -> int:
+        """After an app-data pass ends (early-abort or natural finish),
+        sweep the job folder for any HTML files that Chrome dropped but
+        we never moved into per-candidate folders. Match by candidate-
+        name slug, move into candidate folder, mark in checkpoint, bump
+        success count. Returns the count of files claimed.
+
+        Why this exists: even with the bumped wait + slug-scoped match,
+        a few candidates can still have their HTML land just past the
+        deadline (OneDrive lag is unpredictable). Without this sweep
+        those files sit orphaned in the job folder and would need a
+        manual move. With it, HR's run that aborted on the 5th-failure
+        threshold still reaps real successes from the partially-completed
+        downloads.
+        """
+        if not self.current_job_folder:
+            return 0
+        job_folder = self.current_job_folder
+        claimed = 0
+        # Same shared-display-name guard as the main pass: this sweep runs on
+        # its own after an abort, so it cannot rely on the pass having set it.
+        self._note_roster_slugs(candidates_list)
+
+        for candidate in candidates_list or []:
+            name = candidate.get('name') or ''
+            if not name:
+                continue
+            if name in self.checkpoint_data.get('downloaded_application_data', []):
+                continue  # already counted in main pass
+            slug = self._candidate_name_slug(name)
+            if not slug:
+                continue
+
+            # Exact match only — see _exact_application_html_matches. The
+            # sweep walks candidates in list order, so a prefix glob let a
+            # shorter slug reach a longer-named applicant's file first: one
+            # gained someone else's answers, the real owner found nothing.
+            if self._roster_slug_count(slug) > 1:
+                if self.log:
+                    self.log.event('app_data_html_ambiguous_name',
+                                   {'slug': slug, 'where': 'late_claim'})
+                continue
+            matches = self._exact_application_html_matches(job_folder, slug)
+            if not matches:
+                continue
+
+            # Same reason as the app-data pass: the API dict is right here, so
+            # key on the Indeed ID rather than on a name that may be shared.
+            # Unlike that pass this sweep has no legacy-id guard in front of
+            # it, so hand the dict over only when it actually carries one.
+            # entry_key would otherwise return a _nokey: key directly and skip
+            # the name lookup that finds the folder the CV pass recorded —
+            # this way the id-less case degrades to exactly the old behavior.
+            candidate_folder = self._candidate_folder_for(
+                name, candidate if candidate.get('legacy_id') else None
+            )
+            html_target = candidate_folder / "application.html"
+
+            for f in matches:
+                if not (f.is_file() and f.stat().st_size > 0):
+                    continue
+                try:
+                    if html_target.exists():
+                        html_target.unlink()
+                    f.rename(html_target)
+                    self._save_checkpoint(name=name, app_data=True)
+                    self.stats['app_data_downloaded'] += 1
+                    claimed += 1
+                    if self.log:
+                        self.log.event('app_data_late_claim', {
+                            'candidate': name,
+                            'slug': slug,
+                            'source': str(f.name),
+                        })
+                    break  # one file per candidate
+                except OSError as e:
+                    if self.log:
+                        self.log.event('app_data_late_claim_failed', {
+                            'candidate': name,
+                            'err': repr(e),
+                        })
+
+        return claimed
+
+    def _fetch_application_json_via_page(self, candidate_folder: Path,
+                                         legacy_id: Optional[str] = None) -> bool:
+        """Best-effort fetch of the candidate's screener Q&A JSON from
+        Indeed's iq/job/answers endpoint, executed via fetch() inside
+        the candidate's profile page (so cookies + CSRF are inherited).
+
+        Endpoint discovered from passive URL capture in
+        logs/app_data_urls.json:
+            GET /api/v2/iq/job/answers
+                ?indeedcsrftoken=<tok>
+                &indeedClientApplication=candidate-qualifications
+                &candidateIds=<legacy_id>
+
+        Which applicant this is comes from the CALLER when the caller knows —
+        the backend pass holds the same API dict that chose candidate_folder.
+        The id used to be read off driver.current_url alone, which made the
+        answers fetched and the folder written two independent facts:
+        driver.get(profile_url) is not verified, so a soft redirect or a
+        navigation the SPA swallowed leaves the previous candidate's page
+        rendered, and that person's answers were written here. Nothing on
+        disk recorded the mismatch.
+
+        So the URL is now a CHECK, not the source. If the caller passes an id
+        and the browser is showing a different one, the navigation did not
+        land and we refuse rather than write.
+
+        The URL is only read at all on a `/candidates/view` profile page. On
+        the LIST view, `/candidates?id=X`, that X is the JOB short id — this
+        file reads exactly that shape into current_job_legacy_id, and the real
+        run log shows `URL: .../candidates?id=039e9cc5ab1c` followed by
+        `Job legacy id: 039e9cc5ab1c`. Treating it as a candidate id asks
+        Indeed for the job and files the answer under whichever applicant
+        happens to be in hand. The frontend pass, which reaches a candidate by
+        clicking and carries no id of its own, is exactly the caller that can
+        be sitting on the list view.
+
+        CSRF token is discovered by trying meta tag, cookie, and inline
+        HTML scrape — Indeed exposes it in at least one of these.
+
+        Returns True iff JSON saved to candidate_folder/application.json.
+        Caller should NOT block on the result — HTML alone contains the
+        same data in human-readable form, so we treat the JSON as a
+        bonus, not a requirement. All outcomes are logged for triage.
+        """
+        try:
+            current_url = self.driver.current_url or ''
+        except Exception as e:
+            current_url = ''
+            if self.log:
+                self.log.event('app_data_json_fetch_skip',
+                               {'reason': 'url_read_failed', 'err': repr(e)})
+        # Only a profile page's `id=` is a candidate. See the docstring: on the
+        # list view it is the JOB id.
+        url_id = None
+        if '/candidates/view' in urlparse(current_url).path:
+            m = re.search(r'[?&]id=([^&]+)', current_url)
+            url_id = unquote(m.group(1)) if m else None
+
+        if legacy_id and url_id and str(url_id) != str(legacy_id):
+            # The browser is not where the caller thinks it is. Writing now
+            # files this applicant's folder with someone else's answers.
+            if self.log:
+                self.log.event('app_data_json_fetch_skip', {
+                    'reason': 'url_id_does_not_match_caller',
+                    'expected': str(legacy_id),
+                    'browser_showing': str(url_id),
+                })
+            return False
+
+        candidate_id = str(legacy_id or url_id or '')
+        if not candidate_id:
+            if self.log:
+                self.log.event('app_data_json_fetch_skip',
+                               {'reason': 'no_id_from_caller_or_url'})
+            return False
+
+        # Get a CSRF token. Cache it the first time we discover one — the
+        # token is session-scoped and stable for the whole run, so we don't
+        # need to re-discover per candidate (saves a Chrome perf-log scan
+        # every iteration). Source priority:
+        #   1. Cached value from a prior iteration in this run.
+        #   2. Chrome's performance log — Indeed fires the iq/job/answers
+        #      URL itself during the modal flow, with the token in the
+        #      query string. Captured passively.
+        #   3. Page DOM (meta / cookie / inline HTML) — Indeed used to
+        #      expose the token there in older builds; kept as fallback.
+        # If all three fail, fetch without the token. Indeed will return
+        # 403, the JSON is skipped, HTML still ships, helper still succeeds.
+        csrf_token = getattr(self, '_indeed_csrf_token', None)
+        if not csrf_token:
+            csrf_token = self._discover_csrf_from_perflog()
+            if csrf_token:
+                self._indeed_csrf_token = csrf_token
+                if self.log:
+                    self.log.event('csrf_token_discovered', {'source': 'perflog'})
+
+        js = r"""
+        const callback = arguments[arguments.length - 1];
+        const candidateId = arguments[0];
+        const cachedCsrf = arguments[1];
+
+        // Prefer the token Python passed in (discovered from perflog or
+        // cached from a prior iteration). Fall back to page-DOM scrape if
+        // Python didn't have one.
+        let csrf = cachedCsrf || null;
+        if (!csrf) {
+            const meta = document.querySelector('meta[name="indeedcsrftoken"], meta[name="csrf-token"]');
+            if (meta) csrf = meta.getAttribute('content') || meta.getAttribute('value');
+        }
+        if (!csrf) {
+            const m = document.cookie.match(/(?:^|;\s*)(?:indeedcsrftoken|CSRF|csrf)=([^;]+)/i);
+            if (m) csrf = decodeURIComponent(m[1]);
+        }
+        if (!csrf) {
+            const html = document.documentElement.outerHTML.slice(0, 800000);
+            const m = html.match(/indeedcsrftoken["'=:\s]+([a-f0-9]{16,})/i);
+            if (m) csrf = m[1];
+        }
+
+        let url = '/api/v2/iq/job/answers'
+                + '?indeedClientApplication=candidate-qualifications'
+                + '&candidateIds=' + encodeURIComponent(candidateId);
+        if (csrf) url += '&indeedcsrftoken=' + encodeURIComponent(csrf);
+
+        fetch(url, {credentials: 'include', headers: {'Accept': 'application/json'}})
+            .then(r => r.ok
+                ? r.json().then(data => callback({ok: true, csrf_found: !!csrf, status: r.status, data}))
+                : callback({ok: false, csrf_found: !!csrf, status: r.status, err: 'HTTP ' + r.status}))
+            .catch(err => callback({ok: false, csrf_found: !!csrf, err: String(err)}));
+        """
+
+        # 429 backoff loop. Indeed has been gentle to the resume CV path
+        # at this cadence (~3-7 candidates/min for app-data, even more
+        # conservative than CV's ~18/min), but if Indeed ever does push
+        # back this turns "silent failure on this candidate" into "wait
+        # and retry, succeed on attempt 2-3". Exponential backoff
+        # 1s → 2s → 4s, capped at 8s. Only retries on 429; non-rate
+        # failures (auth, 404, network) bail immediately since retry
+        # won't change them.
+        max_attempts = 3
+        backoff_s = 1.0
+        result = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                self.driver.set_script_timeout(15)
+                result = self.driver.execute_async_script(js, candidate_id, csrf_token)
+            except Exception as e:
+                if self.log:
+                    self.log.event('app_data_json_fetch_error',
+                                   {'err': repr(e), 'candidate_id': candidate_id,
+                                    'attempt': attempt})
+                return False
+
+            if result and result.get('ok'):
+                break
+
+            status = result.get('status') if result else None
+            if status == 429 and attempt < max_attempts:
+                if self.log:
+                    self.log.event('app_data_json_rate_limit_backoff', {
+                        'candidate_id': candidate_id,
+                        'attempt': attempt,
+                        'backoff_s': backoff_s,
+                    })
+                time.sleep(backoff_s)
+                backoff_s = min(backoff_s * 2, 8.0)
+                continue
+
+            # Non-429 failure (auth, 404, network) — retry won't help.
+            break
+
+        if not result or not result.get('ok'):
+            if self.log:
+                self.log.event('app_data_json_fetch_failed', {
+                    'candidate_id': candidate_id,
+                    'csrf_found': result.get('csrf_found') if result else None,
+                    'status': result.get('status') if result else None,
+                    'err': result.get('err') if result else 'no_result',
+                    'attempts': attempt,
+                })
+            return False
+
+        json_target = candidate_folder / "application.json"
+        try:
+            with open(json_target, 'w', encoding='utf-8') as f:
+                json.dump(result.get('data'), f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            if self.log:
+                self.log.event('app_data_json_save_failed',
+                               {'err': repr(e), 'candidate_id': candidate_id})
+            return False
+
+        if self.log:
+            self.log.event('app_data_json_saved', {
+                'candidate_id': candidate_id,
+                'csrf_found': result.get('csrf_found'),
+            })
+        return True
 
     def _go_to_next_candidate(self) -> bool:
         """Navigate to next candidate"""
@@ -1557,26 +3634,43 @@ class IndeedDownloader:
                     except NoSuchElementException:
                         pass
 
-                    # Extract the employerJobId from the link
-                    employer_job_id = None
+                    # Extract BOTH id forms from the link. Indeed embeds
+                    # the long IRI form (`employerJobId=` for GraphQL queries)
+                    # and the short base64 form (`id=` for /candidates/view
+                    # profile URLs as legacyJobId) in the same job-link URL.
+                    # The single-job path reads the short form from the URL
+                    # bar; in all-jobs mode the URL bar is the /jobs table,
+                    # so we have to harvest both params here. If the short
+                    # form is missing, the app-data pass falls back to a
+                    # legacyJobId-less profile URL and Indeed may hide the
+                    # "Download application data" menu — silent failure.
+                    employer_job_id = None  # IRI form, used by GraphQL
+                    short_id = None         # base64 short form, used by app-data
                     if job_link:
-                        # Try employerJobId first
-                        if 'employerJobId=' in job_link:
-                            match = re.search(r'employerJobId=([^&]+)', job_link)
-                            if match:
-                                employer_job_id = unquote(match.group(1))
-                        # Try id parameter
-                        elif 'id=' in job_link:
-                            match = re.search(r'[?&]id=([^&]+)', job_link)
-                            if match:
-                                employer_job_id = unquote(match.group(1))
+                        iri_match = re.search(r'employerJobId=([^&]+)', job_link)
+                        if iri_match:
+                            employer_job_id = unquote(iri_match.group(1))
+                        short_match = re.search(r'[?&]id=([^&]+)', job_link)
+                        if short_match:
+                            short_id = unquote(short_match.group(1))
+                        # Fallback for jobs that only expose `id=`: treat the
+                        # short form as the GraphQL identifier too. Preserves
+                        # prior behavior for jobs without an `employerJobId=`.
+                        if not employer_job_id and short_id:
+                            employer_job_id = short_id
 
-                    # If still no ID, create one from title + date
+                    has_valid_api_id = bool(employer_job_id)
+
+                    # If still no ID, create a synthetic one — used ONLY for folder
+                    # naming and dedup. It must NOT be passed to the GraphQL API as
+                    # employerJobId (Indeed returns empty results silently).
                     if not employer_job_id:
                         employer_job_id = f"{clean_title}_{date_formatted}".replace(' ', '_')
 
                     jobs.append({
                         'id': employer_job_id,
+                        'short_id': short_id,
+                        'has_valid_api_id': has_valid_api_id,
                         'title': title,
                         'title_clean': clean_title,
                         'status': status,
@@ -1699,271 +3793,6 @@ class IndeedDownloader:
 
         return all_jobs
 
-    def _find_existing_job_folders(self, jobs: list) -> dict:
-        """Find which jobs already have folders in downloads
-
-        Returns dict mapping job_id -> folder info, ensuring each folder is matched to only one job.
-        Matching priority:
-        1. Exact name + exact date (score 4) - must match
-        2. Exact name only (score 2) - only if folder has no date or job has no date
-        3. Partial name + exact date (score 3)
-        4. Partial name only (score 1) - only if folder has no date or job has no date
-
-        IMPORTANT: If both job and folder have dates, they MUST match for name matching.
-        """
-        existing = {}
-        download_path = Path(self.download_folder)
-
-        if not download_path.exists():
-            return existing
-
-        # Normalize function for comparison (removes accents for comparison only)
-        def normalize(s):
-            import unicodedata
-            s = unicodedata.normalize('NFKD', s).encode('ASCII', 'ignore').decode('ASCII')
-            s = re.sub(r'[^a-z0-9\s]', '', s.lower())
-            s = re.sub(r'\s+', ' ', s).strip()
-            return s
-
-        # Get all folders with their info
-        folder_info = {}
-        for folder in download_path.iterdir():
-            if folder.is_dir():
-                # Format: "Nom du job (DD-MM-YYYY)"
-                match = re.match(r'(.+) \((\d{2}-\d{2}-\d{4})\)$', folder.name)
-                if match:
-                    job_name = match.group(1)
-                    date = match.group(2)
-                    clean_name = self._clean_job_title(job_name)
-                    normalized = normalize(clean_name)
-                    # Load stats from stats.json if exists, otherwise count PDFs
-                    stats = self._load_job_stats(folder)
-                    if stats:
-                        cv_count = stats.get('processed', 0)
-                        total_recovered = stats.get('total_recovered', cv_count)
-                    else:
-                        # Fallback: count PDFs + no_cv.txt entries
-                        cv_count = len(list(folder.rglob('*.pdf')))
-                        no_cv_file = folder / 'no_cv.txt'
-                        if no_cv_file.exists():
-                            with open(no_cv_file, 'r', encoding='utf-8') as f:
-                                cv_count += sum(1 for line in f if line.strip())
-                        total_recovered = cv_count  # No stats, assume all processed
-                    folder_info[folder.name] = {
-                        'original_name': job_name,
-                        'clean_name': clean_name,
-                        'normalized_name': normalized,
-                        'date': date,
-                        'cv_count': cv_count,
-                        'total_recovered': total_recovered,
-                        'matched_job_id': None  # Track which job matched this folder
-                    }
-                else:
-                    clean_name = self._clean_job_title(folder.name)
-                    normalized = normalize(clean_name)
-                    # Load stats from stats.json if exists, otherwise count PDFs
-                    stats = self._load_job_stats(folder)
-                    if stats:
-                        cv_count = stats.get('processed', 0)
-                        total_recovered = stats.get('total_recovered', cv_count)
-                    else:
-                        # Fallback: count PDFs + no_cv.txt entries
-                        cv_count = len(list(folder.rglob('*.pdf')))
-                        no_cv_file = folder / 'no_cv.txt'
-                        if no_cv_file.exists():
-                            with open(no_cv_file, 'r', encoding='utf-8') as f:
-                                cv_count += sum(1 for line in f if line.strip())
-                        total_recovered = cv_count  # No stats, assume all processed
-                    folder_info[folder.name] = {
-                        'original_name': folder.name,
-                        'clean_name': clean_name,
-                        'normalized_name': normalized,
-                        'date': None,
-                        'cv_count': cv_count,
-                        'total_recovered': total_recovered,
-                        'matched_job_id': None
-                    }
-
-        print(f"\n   {len(folder_info)} folders found in '{self.download_folder}/'")
-
-        # Match jobs with folders - each folder can only match ONE job
-        # First pass: match jobs that have exact name + date match (highest priority)
-        matched_count = 0
-        for job in jobs:
-            job_clean = job.get('title_clean', self._clean_job_title(job['title']))
-            job_normalized = normalize(job_clean)
-            job_date = job.get('date', '')
-            job_id = job['id']
-
-            # Only look for exact name + date matches in first pass
-            if not job_date:
-                continue
-
-            for folder_name, info in folder_info.items():
-                if info['matched_job_id'] is not None:
-                    continue
-
-                folder_normalized = info['normalized_name']
-                folder_date = info['date']
-
-                # Exact name + exact date match
-                if job_normalized == folder_normalized and folder_date == job_date:
-                    folder_info[folder_name]['matched_job_id'] = job_id
-                    existing[job_id] = {
-                        'title': job['title'],
-                        'title_clean': job_clean,
-                        'folder': folder_name,
-                        'cv_count': info['cv_count'],
-                        'total_recovered': info['total_recovered'],
-                        'total_candidates': job.get('total_candidates', 0),
-                        'date': job_date
-                    }
-                    matched_count += 1
-                    break
-
-        print(f"   {matched_count} folders match jobs")
-
-        # Second pass: for jobs without date match, try name-only match (only for folders without date)
-        for job in jobs:
-            job_id = job['id']
-            if job_id in existing:
-                continue  # Already matched
-
-            job_clean = job.get('title_clean', self._clean_job_title(job['title']))
-            job_normalized = normalize(job_clean)
-            job_date = job.get('date', '')
-
-            best_match = None
-            best_match_score = 0
-
-            for folder_name, info in folder_info.items():
-                if info['matched_job_id'] is not None:
-                    continue
-
-                folder_normalized = info['normalized_name']
-                folder_date = info['date']
-
-                # If both have dates and they don't match, skip this folder
-                if job_date and folder_date and job_date != folder_date:
-                    continue
-
-                score = 0
-
-                # Exact name match
-                if job_normalized == folder_normalized:
-                    # Higher score if dates match or no dates to compare
-                    if job_date and folder_date and job_date == folder_date:
-                        score = 4  # Best: exact name + exact date
-                    elif not job_date or not folder_date:
-                        score = 2  # Good: exact name, one or both missing date
-                    # If dates don't match, score stays 0 (skip)
-
-                # Partial match (one contains the other) - only for longer names
-                elif len(job_normalized) >= 10 and len(folder_normalized) >= 10:
-                    if job_normalized in folder_normalized or folder_normalized in job_normalized:
-                        if job_date and folder_date and job_date == folder_date:
-                            score = 3  # Good: partial name + exact date
-                        elif not job_date or not folder_date:
-                            score = 1  # OK: partial name, one or both missing date
-                        # If dates don't match, score stays 0 (skip)
-
-                if score > best_match_score:
-                    best_match_score = score
-                    best_match = folder_name
-
-            # If we found a match, mark the folder as matched
-            if best_match and best_match_score > 0:
-                folder_info[best_match]['matched_job_id'] = job_id
-                existing[job_id] = {
-                    'title': job['title'],
-                    'title_clean': job_clean,
-                    'folder': best_match,
-                    'cv_count': folder_info[best_match]['cv_count'],
-                    'total_recovered': folder_info[best_match]['total_recovered'],
-                    'total_candidates': job.get('total_candidates', 0),
-                    'date': job_date
-                }
-
-        return existing
-
-    def _ask_skip_existing_jobs(self, jobs: list, existing_jobs: dict) -> list:
-        """Ask user which existing jobs to skip
-
-        Args:
-            jobs: List of all jobs
-            existing_jobs: Dict of jobs that have existing folders
-        """
-        if not existing_jobs:
-            return jobs
-
-        print("\n" + "=" * 60)
-        print("JOBS ALREADY PRESENT IN THE DOWNLOADS FOLDER:")
-        print("=" * 60)
-
-        jobs_with_new = []
-        jobs_complete = []
-
-        for job_id, info in existing_jobs.items():
-            cv_count = info['cv_count']  # processed
-            total_recovered = info.get('total_recovered', cv_count)  # what API returned
-            total_announced = info['total_candidates']  # what job listing shows
-            # Use cleaned title for display
-            title = info.get('title_clean', info['title'])
-            folder = info['folder']
-            date = info.get('date', '')
-
-            # Format title with date for clarity
-            title_with_date = f"{title} ({date})" if date else title
-
-            # Compare with total_recovered (not total_announced) to determine completion
-            if cv_count < total_recovered:
-                jobs_with_new.append((job_id, info))
-                print(f"   [NEW] {title_with_date}")
-                print(f"         Folder: {folder}")
-                print(f"         {cv_count} processed / {total_recovered} fetched (+{total_recovered - cv_count} remaining)")
-            else:
-                jobs_complete.append((job_id, info))
-                # Show both recovered and announced if different
-                if total_recovered < total_announced:
-                    print(f"   [OK]  {title_with_date} ({cv_count}/{total_recovered} fetched, {total_announced} posted)")
-                else:
-                    print(f"   [OK]  {title_with_date} ({cv_count}/{total_announced})")
-
-        print()
-        if jobs_with_new:
-            print(f"   {len(jobs_with_new)} jobs with new candidates")
-        print(f"   {len(jobs_complete)} complete jobs")
-        print()
-        print("Options:")
-        print("   [S] SkipAll - Skip ALL existing jobs")
-        print("   [N] NewOnly - Only download jobs with new candidates")
-        print("   [K] KeepAll - Download every job anyway")
-        print()
-
-        while True:
-            choice = input("Your choice (S/N/K): ").strip().upper()
-
-            if choice == 'S':
-                # Skip all existing
-                jobs_to_skip = set(existing_jobs.keys())
-                filtered_jobs = [j for j in jobs if j['id'] not in jobs_to_skip]
-                print(f"\n{len(jobs_to_skip)} jobs skipped")
-                return filtered_jobs
-
-            elif choice == 'N':
-                # Only jobs with new candidates
-                jobs_with_new_ids = set(job_id for job_id, _ in jobs_with_new)
-                filtered_jobs = [j for j in jobs if j['id'] in jobs_with_new_ids]
-                print(f"\n{len(jobs_complete)} complete jobs skipped, {len(filtered_jobs)} to process")
-                return filtered_jobs
-
-            elif choice == 'K':
-                # Keep all
-                print("\nAll jobs will be processed")
-                return jobs
-
-            print("Invalid choice, type S, N or K")
-
     def _filter_old_jobs(self, jobs: list) -> list:
         """Filter out jobs older than 2 years (Indeed archives candidate data after ~2 years)"""
         from datetime import datetime, timedelta
@@ -1996,6 +3825,8 @@ class IndeedDownloader:
 
         if not jobs:
             print("No jobs found")
+            if self.log:
+                self.log.event('all_jobs_no_jobs_found', {})
             return
 
         # Filter out jobs older than 2 years (Indeed archives data)
@@ -2003,20 +3834,81 @@ class IndeedDownloader:
 
         if not jobs:
             print("No recent jobs to process (all > 2 years)")
+            if self.log:
+                self.log.event('all_jobs_all_filtered_old', {})
             return
 
-        # Check for existing folders (compare by name, not checkpoint)
-        existing_jobs = self._find_existing_job_folders(jobs)
+        # Every job is re-checked. The old S/N/K prompt classified a job as
+        # complete by comparing stats.json to itself, so any job that had
+        # finished once was [OK] forever and option N silently dropped its
+        # new applicants. An id-level diff also catches churn a count
+        # comparison misses: one applicant withdraws, one arrives, the
+        # total is unchanged.
+        print("\n   Checking which applicants each job already has...")
+        for job in jobs:
+            folder = manifest_mod.resolve_job_folder(
+                Path(self.download_folder), job.get('id'), job.get('short_id')
+            )
+            existing = manifest_mod.load(folder) if folder else None
+            live = job.get('total_candidates', 0)
+            title = job.get('title_clean', job['title'])
+            if existing:
+                print(f"   {title}: {len(existing['candidates'])} on disk · {live} live")
+                continue
 
-        if existing_jobs:
-            jobs = self._ask_skip_existing_jobs(jobs, existing_jobs)
-
-        if not jobs:
-            print("No jobs to process!")
-            return
+            # No manifest yet does NOT mean no downloads. On the first run
+            # after an upgrade every folder is manifest-less, and counting the
+            # manifest alone called all of them "new" — the one line HR reads
+            # while wondering whether her existing downloads are safe. The
+            # job loop recovers those folders a moment later ("Recovered 33
+            # existing candidates from disk"), so the summary was the only
+            # thing lying. Look the folder up the same way _create_job_folder
+            # will, and say where the count came from: a folder count and a
+            # manifest count are not the same number.
+            legacy_folder = manifest_mod.resolve_legacy_folder_by_name(
+                Path(self.download_folder),
+                self._clean_job_title(job.get('title') or '')[:80],
+                job.get('date') or None,
+            )
+            on_disk = manifest_mod.count_candidate_folders(legacy_folder) if legacy_folder else 0
+            if on_disk:
+                print(f"   {title}: {on_disk} on disk (from an older run, no manifest yet) · {live} live")
+            else:
+                print(f"   {title}: new · {live} live")
 
         print(f"\n{len(jobs)} jobs to process")
         print("=" * 60)
+
+        # Run-level event so we know the planned scope. job_summary is a
+        # truncated list (id + short_id + title + status + candidate count
+        # only) so we can correlate per-job events with the planned set
+        # without dumping job_link or other PII-adjacent fields.
+        if self.log:
+            self.log.event('all_jobs_run_start', {
+                'total_jobs': len(jobs),
+                'mode': self.mode,
+                'job_statuses_filter': sorted(self.job_statuses),
+                'download_app_data': self.download_app_data,
+                'job_summary': [
+                    {
+                        'index': i,
+                        'id_present': bool(job.get('id')),
+                        'short_id_present': bool(job.get('short_id')),
+                        'has_valid_api_id': job.get('has_valid_api_id', False),
+                        'status': job.get('status'),
+                        'date': job.get('date'),
+                        'total_candidates': job.get('total_candidates', 0),
+                        'title_truncated': (job.get('title_clean') or job.get('title') or '')[:80],
+                    }
+                    for i, job in enumerate(jobs)
+                ],
+            })
+
+        # Aggregate counters for the run summary at the end.
+        run_started_at = time.time()
+        jobs_completed = 0
+        jobs_skipped_archived = 0
+        jobs_errored = 0
 
         for i, job in enumerate(jobs):
             title_display = job.get('title_clean', job['title'])
@@ -2025,22 +3917,119 @@ class IndeedDownloader:
 
             self.current_job_id = job['id']
             self.current_job_name = job['title']
-            self._create_job_folder(job['title'], job['date'])
+            # Reset before each job; harvested from job-link URL above.
+            # Single-job path sets this from the URL bar; all-jobs path
+            # gets it from the /jobs table extraction. Without it, the
+            # app-data pass falls back to /candidates/view?id=<X> which
+            # may not surface the "Download application data" menu.
+            self.current_job_legacy_id = job.get('short_id')
 
-            if self.mode == 'backend':
-                # Close any modals that might appear
-                self._close_modals()
-                self._download_all_candidates_api(job.get('total_candidates', 0))
-            else:
-                # Navigate to job
-                self.driver.get(f"https://employers.indeed.com/candidates?selectedJobs={job['id']}")
-                time.sleep(3)
-                # Close any modals that might appear
-                self._close_modals()
-                self._download_all_candidates_frontend()
+            # Snapshot global stats so we can derive a per-job delta in
+            # all_jobs_job_done. Without this, a failed job is invisible
+            # in the log unless the deeper helpers happen to log — and
+            # downloaded/app_data_downloaded only show the run total.
+            stats_before = {
+                'downloaded': self.stats.get('downloaded', 0),
+                'failed': self.stats.get('failed', 0),
+                'skipped': self.stats.get('skipped', 0),
+                'app_data_downloaded': self.stats.get('app_data_downloaded', 0),
+                'archived': self.stats.get('archived', 0),
+            }
+            job_started_at = time.time()
+            if self.log:
+                self.log.event('all_jobs_job_start', {
+                    'index': i,
+                    'total': len(jobs),
+                    'job_id': job.get('id'),
+                    'short_id': job.get('short_id'),
+                    'has_valid_api_id': job.get('has_valid_api_id', False),
+                    'title_truncated': title_display[:80],
+                    'status': job.get('status'),
+                    'date': job.get('date'),
+                    'total_candidates': job.get('total_candidates', 0),
+                })
 
-            self._save_checkpoint(job_id=job['id'])
-            print(f"   Job finished: {title_display}")
+            try:
+                self._create_job_folder(
+                    job['title'], job['date'],
+                    employer_job_id=job.get('id'),
+                    short_id=job.get('short_id'),
+                )
+
+                if self.mode == 'backend':
+                    # Synthetic IDs (title + date) cannot be passed to the GraphQL
+                    # API as employerJobId — Indeed returns empty results silently.
+                    # Skip the job so the user can fall back to Frontend mode for it.
+                    if not job.get('has_valid_api_id', True):
+                        print(f"   ⚠ Skipping — no Indeed employerJobId on the jobs-table link. Use Frontend mode for this job.")
+                        self.stats['archived'] += 1
+                        jobs_skipped_archived += 1
+                        if self.log:
+                            self.log.event('all_jobs_job_skipped', {
+                                'index': i,
+                                'reason': 'no_valid_api_id',
+                                'title_truncated': title_display[:80],
+                            })
+                        continue
+                    # Close any modals that might appear
+                    self._close_modals()
+                    self._download_all_candidates_api(job.get('total_candidates', 0))
+                else:
+                    # Navigate to job
+                    self.driver.get(f"https://employers.indeed.com/candidates?selectedJobs={job['id']}")
+                    time.sleep(3)
+                    # Close any modals that might appear
+                    self._close_modals()
+                    self._download_all_candidates_frontend()
+
+                self._save_checkpoint(job_id=job['id'])
+                print(f"   Job finished: {title_display}")
+                jobs_completed += 1
+
+                if self.log:
+                    self.log.event('all_jobs_job_done', {
+                        'index': i,
+                        'job_id': job.get('id'),
+                        'title_truncated': title_display[:80],
+                        'duration_s': round(time.time() - job_started_at, 1),
+                        'delta_downloaded': self.stats.get('downloaded', 0) - stats_before['downloaded'],
+                        'delta_failed': self.stats.get('failed', 0) - stats_before['failed'],
+                        'delta_skipped': self.stats.get('skipped', 0) - stats_before['skipped'],
+                        'delta_app_data_downloaded': self.stats.get('app_data_downloaded', 0) - stats_before['app_data_downloaded'],
+                    })
+
+            except Exception as e:
+                # A single job's failure must not kill the whole all-jobs
+                # run. Log full context and move to the next job — HR can
+                # rerun the failed job individually later by name. This
+                # mirrors the resume-friendly philosophy of the rest of
+                # the tool (every CV is checkpointed; every job here is too).
+                jobs_errored += 1
+                err_msg = repr(e)
+                print(f"   ❌ Job errored, continuing: {err_msg[:200]}")
+                if self.log:
+                    import traceback
+                    self.log.event('all_jobs_job_error', {
+                        'index': i,
+                        'job_id': job.get('id'),
+                        'short_id': job.get('short_id'),
+                        'title_truncated': title_display[:80],
+                        'duration_s': round(time.time() - job_started_at, 1),
+                        'error': err_msg[:500],
+                        'traceback_tail': traceback.format_exc()[-1000:],
+                    })
+
+        if self.log:
+            self.log.event('all_jobs_run_summary', {
+                'total_jobs': len(jobs),
+                'jobs_completed': jobs_completed,
+                'jobs_skipped_archived': jobs_skipped_archived,
+                'jobs_errored': jobs_errored,
+                'duration_s': round(time.time() - run_started_at, 1),
+                'final_downloaded': self.stats.get('downloaded', 0),
+                'final_failed': self.stats.get('failed', 0),
+                'final_app_data_downloaded': self.stats.get('app_data_downloaded', 0),
+            })
 
     # ==================== MAIN ====================
 
@@ -2165,7 +4154,11 @@ class IndeedDownloader:
             self.show_menu()
 
             if not self.setup_chrome():
+                if self.log:
+                    self.log.event('setup_chrome', {'ok': False})
                 return
+            if self.log:
+                self.log.event('setup_chrome', {'ok': True, 'has_api_key': bool(self.api_key), 'has_ctk': bool(self.ctk)})
 
             self.start_time = time.time()
 
@@ -2181,22 +4174,75 @@ class IndeedDownloader:
 
         except KeyboardInterrupt:
             print("\n\n⚠️ Interrupted by user")
+            if self.log:
+                self.log.info('interrupted_by_user')
             self.print_statistics()
 
         except Exception as e:
             print(f"\n❌ Error: {e}")
-            import traceback
             traceback.print_exc()
+            if self.log:
+                self.log.error('fatal_in_run', e)
 
         finally:
+            if self.log:
+                # Dump final stats for the bug-report bundle.
+                self.log.event('final_stats', dict(self.stats))
             if self.driver:
-                input("\nPress Enter to close Chrome...")
-                self.driver.quit()
+                # In attach mode don't kill the Chrome subprocess — the user
+                # may want to keep browsing. Just detach Selenium.
+                if self.browser_launch == 'attach':
+                    try:
+                        # quit() would tear down the browser; we only want
+                        # to release our session. Selenium doesn't expose a
+                        # "detach without quitting" method, but dropping the
+                        # reference keeps Chrome alive because we spawned it
+                        # as a detached subprocess above.
+                        self.driver = None
+                    except Exception:
+                        pass
+                    print("\n(Chrome window left open — close it yourself when you're done.)")
+                else:
+                    input("\nPress Enter to close Chrome...")
+                    self.driver.quit()
+
+
+def _install_crash_logger(logger: RunLogger):
+    """Catch anything that bypasses run()'s try/except (e.g., during import
+    or menu input) so the log captures the full traceback before the .exe
+    console closes."""
+    def _hook(exc_type, exc_value, exc_tb):
+        try:
+            logger.error('uncaught_exception', exc_value)
+        except Exception:
+            pass
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+    sys.excepthook = _hook
 
 
 def main():
-    downloader = IndeedDownloader()
-    downloader.run()
+    # Resolve log folder the same way IndeedDownloader does so we write to
+    # the same place. Default "logs" is relative to cwd, which for a .exe
+    # is typically the folder the user double-clicked.
+    log_folder = Path(os.getenv('LOG_FOLDER', 'logs'))
+    logger = RunLogger(log_folder)
+    _install_crash_logger(logger)
+
+    # Mirror every print() into the log file so the user's console output
+    # is preserved verbatim. Don't tee stderr — tqdm's progress bars would
+    # fill the log with carriage-return spam.
+    sys.stdout = _TeeStream(sys.stdout, logger.raw_file)
+
+    print(f"📝 Run log: {logger.path}")
+    print(f"   (if something breaks, send the file at: {logger.latest_path})")
+    print()
+
+    downloader = IndeedDownloader(log=logger)
+    try:
+        downloader.run()
+    finally:
+        logger.close()
+        print(f"\n📝 Log saved: {logger.latest_path}")
 
 
 if __name__ == "__main__":

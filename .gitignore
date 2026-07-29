@@ -45,8 +45,17 @@ Thumbs.db
 downloads/*.pdf
 downloads/*.doc
 downloads/*.docx
-logs/*.log
-logs/*.json
+
+# Everything the tool writes under logs/ is sensitive: the session cookie, the
+# run logs (applicant names, and today a CTK value), the captured URLs (live
+# CSRF tokens), and attach mode's chrome_profile/ — a persistent Chrome profile
+# holding the live Indeed employer session, cookie DB and all.
+#
+# Ignore the directory rather than listing extensions. The previous rules were
+# single-level globs (logs/*.log, logs/*.json), so logs/chrome_profile/Default/
+# Cookies matched none of them and sat one `git add .` from a public fork. The
+# next artifact dropped in here is ignored by default instead of by remembering.
+logs/**
 
 # Spec files
 *.spec
@@ -68,3 +77,23 @@ logs/*.json
 # Chrome driver
 chromedriver.exe
 chromedriver
+
+# DevTools network captures from HR — contain bearer tokens + session cookies
+indeed_graphql_*.txt
+
+# Live Indeed session token — treat like a password (see HR_GUIDE.md security checklist)
+indeed_cookies.json
+
+# Screenshots from debugging sessions. These are taken over a live Indeed
+# employer console, so they capture real applicant profiles — education,
+# certifications, candidate IDs. This repo is a PUBLIC fork; a single
+# `git add .` would publish them irreversibly.
+*.png
+
+# Run reports: job titles and counts, no applicant names, but no reason to
+# ship them. logs/*.log and logs/*.json are already covered above; .txt is not.
+download_report.txt
+logs/*.txt
+
+# Subagent-driven-development scratch workspace
+.superpowers/
